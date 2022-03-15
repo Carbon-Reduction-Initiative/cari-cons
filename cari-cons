@@ -1,0 +1,2806 @@
+#!/bin/bash
+
+# cari-cons is a Bash script calculating power consumption and
+# resource usage of the CARI daemon on Linux.
+# 
+# Run `cari-cons -h` for more details.
+# 
+# Copyright (C) 2022  Carbon Reduction Initiative Limited <https://cri.eco>
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+################################################################################
+# FUNCTIONS
+################################################################################
+
+# Adjust file permissions.
+adjust_file_permissions() {
+	local loc
+	
+	# ------------------
+	
+	for loc in "${!LOC[@]}"; do
+		if [[ -d ${LOC[$loc]} ]]; then
+			chmod -R u=rwX,go=rwX "${LOC[$loc]}"
+		fi
+	done
+}
+
+# Calculate the average of a CSV column.
+calc_avg_csv() {
+	local file=$1
+	local field=$2
+	local scale=$3
+	
+	if ! is pos_int "$scale" true; then
+		scale=5
+	fi
+	
+	# ------------------
+	
+	if [[ -f $file ]] && is pos_int "$field" true; then
+		awk -F ',' "NR > 1 && \$${field} != \"\" {sum+=\$${field}; n++} END {if (n > 0) printf \"%.${scale}f\", sum / n}" "$file"
+	fi
+}
+
+# Calculate averages from the raw data. The global variable "AVG" will be updated.
+calc_avg_from_raw_data() {
+	AVG[CPU usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 2 2)
+	AVG[CPU usage unit]="%"
+	AVG[CPU usage MHz]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 3 0)
+	AVG[CPU usage MHz unit]="MHz"
+	AVG[CPU power consumption]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 4 6)
+	AVG[CPU power consumption unit]="W"
+	
+	AVG[Read from disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 2 2)
+	AVG[Read from disk unit]="KiB/s"
+	AVG[Written to disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 3 2)
+	AVG[Written to disk unit]="KiB/s"
+	AVG[Used disk space]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 4 5)
+	AVG[Used disk space unit]="MiB"
+	
+	AVG[RAM usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:memory.csv" 2 5)
+	AVG[RAM usage unit]="MiB"
+	AVG[Swap usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:memory.csv" 3 5)
+	AVG[Swap usage unit]="MiB"
+	
+	AVG[Network traffic received]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:traffic.csv" 2 6)
+	AVG[Network traffic received unit]="KiB/s"
+	AVG[Network traffic sent]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:traffic.csv" 3 6)
+	AVG[Network traffic sent unit]="KiB/s"
+}
+
+# Check if the command exists and is executable.
+command_exists() {
+	local comm=$1
+	
+	# ------------------
+	
+	command -v "$comm" &> /dev/null
+}
+
+# Convert text list to HTML.
+convert_text_list_to_html() {
+	local text_list=$1
+	
+	local html
+	
+	# ------------------
+	
+	html="<ul>$N"
+	html+=$(sed -E "s~^\+ (.+)$~<li>\1<ul>~g; s~${FORMAT[sep2]}~</ul></li>~g; s~^  - (.+)$~<li>\1</li>~g" <<< "$text_list")$N
+	html+="</ul>$N"
+	
+	echo -n "$html"
+}
+
+# Display help.
+display_help() {
+	local content
+	
+	local script_name
+	
+	# ------------------
+	
+	script_name=${LOC[script_file]##*/}
+	
+	content+="cari-cons is a Bash script calculating power consumption and resource usage$N"
+	content+="of the CARI daemon on Linux.$N"
+	content+=$N
+	content+="Usage: $script_name [OPTIONS]$N"
+	content+=$N
+	content+="OPTIONS:$N"
+	content+=$N
+	content+="    -c           Enable cpu-energy-meter monitoring$N"
+	content+="    -h           Display help$N"
+	content+="    -p           Enable psrecord monitoring$N"
+	content+="    -r PATH      Generate the report using files in the the specified folder$N"
+	content+="                 or the specified ZIP archive (no tests will be run)$N"
+	content+="    -s DURATION  Set the step (interval) duration in seconds$N"
+	content+="    -t DURATION  Set the total duration in seconds$N"
+	content+="    -u           Upload the report to transfer.sh$N"
+	content+="    -z           Stress test the CPU for 60 seconds (no tests will be run)$N"
+	content+=$N
+	content+="EXAMPLES:$N"
+	content+=$N
+	content+="    $script_name -s 2 -t 180$N"
+	content+="    $script_name -r$N"
+	content+=$N
+	
+	echo -n "$content"
+}
+
+# Escape text in order to use it in "sed" commands (pattern or replacement).
+escape_sed() {
+	local text=$1
+	local type=$2
+	
+	local escaped_text
+	
+	# ------------------
+	
+	if [[ $type == "pattern" ]]; then
+		escaped_text=$(sed -e 's/[]\/$*.^[]/\\&/g' <<< "$text")
+	elif [[ $type == "replacement" ]]; then
+		escaped_text=$(sed -e 's/[\/&]/\\&/g' <<< "$text")
+	else
+		escaped_text=$text
+	fi
+	
+	echo -n "$escaped_text"
+}
+
+# Exit the script with the exit code specified in the first argument. If the second argument
+# is not empty, the content will be displayed before exiting.
+exit_script() {
+	local exit_code=$1
+	local msg=$2
+	
+	if ! is pos_int "$exit_code" true; then
+		exit_code=0
+	fi
+	
+	# ------------------
+	
+	if [[ -n $msg ]]; then
+		msg=${FORMAT[color_red_bg]}${msg}${FORMAT[color_default]}${N}
+		msg+="${FORMAT[color_red_bg]}Exiting.${FORMAT[color_default]}"
+		
+		if ((exit_code > 0)); then
+			echo "$msg" 1>&2
+		else
+			echo "$msg"
+		fi
+	fi
+	
+	exit "$exit_code"
+}
+
+# Floating point calculations.
+float_calc() {
+	local calc=$1
+	local scale=$2
+	
+	local result
+	
+	# ------------------
+	
+	result=$(awk "BEGIN { printf \"%.${scale}f\", $calc }" | trim)
+	
+	if ! is float "$result"; then
+		result=""
+	fi
+	
+	echo -n "$result"
+}
+
+# Format PNG images.
+format_png() {
+	declare -a images=("$@")
+	
+	local image
+	
+	# ------------------
+	
+	for image in "${images[@]}"; do
+		if [[ -f $image ]]; then
+			convert "$image" -trim "$image"
+			convert "$image" -gravity center -background white -extent "$(identify -format '%[fx:W+50]x%[fx:H+50]' "$image")" "$image"
+			convert "$image" -border 2x2 -bordercolor "#d9d9d9" "$image"
+		fi
+	done
+}
+
+# Generate plots (PNG).
+generate_plots() {
+	local arrow_start block_line_width common cpu cpu_csv cpu_last_time disk disk_csv disk_last_time
+	local duration elapsed_time line lt memory memory_csv memory_last_time smooth t0 timestamp
+	local traffic traffic_csv traffic_last_time
+	
+	declare -a line_colors
+	declare -A arrows
+	
+	# ------------------
+	
+	duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
+	
+	if ((duration > 3600)); then
+		arrow_start="0.75"
+		block_line_width=1
+	else
+		arrow_start="0"
+		block_line_width=2
+	fi
+	
+	# CSV files
+	###########
+	
+	cpu_csv="Time,CPU usage (%),CPU usage (MHz),CPU power consumption (W)$N"
+	disk_csv="Time,Read from disk (KiB/s),Written to disk (KiB/s),Used disk space (MiB)$N"
+	memory_csv="Time,RAM usage (MiB),Swap usage (MiB)$N"
+	traffic_csv="Time,Network traffic received (KiB/s),Network traffic sent (KiB/s)$N"
+	
+	while IFS="" read -r line || [[ -n $line ]]; do
+		if [[ ! $line =~ ^[0-2] ]]; then
+			continue
+		fi
+		
+		timestamp=$(get_timestamp_report_entry "$line")
+		
+		if [[ -z $t0 ]]; then
+			t0=$timestamp
+			elapsed_time=0
+		else
+			elapsed_time=$(float_calc "$timestamp - $t0" 3)
+		fi
+		
+		# block
+		if [[ $line =~ ^[0-9_:.-]+": block " ]]; then
+			arrows[$elapsed_time]="set arrow from \"$elapsed_time\",graph $arrow_start to \"$elapsed_time\",graph 1 nohead ls 1$N"
+		# cpu
+		elif [[ $line =~ "CPU usage: "([^%]+).+" ("([0-9]+)" MHz)" ]]; then
+			cpu_last_time=$elapsed_time
+			cpu_csv+="$elapsed_time,${BASH_REMATCH[1]},${BASH_REMATCH[2]},$N"
+		elif [[ $line =~ "CPU power consumption: "([^ ]+) ]]; then
+			cpu_last_time=$elapsed_time
+			cpu_csv+="$elapsed_time,,,${BASH_REMATCH[1]}$N"
+		# disk
+		elif [[ $line =~ "read: "([^ ]+).+"written: "([^ ]+) ]]; then
+			disk_last_time=$elapsed_time
+			disk_csv+="$elapsed_time,${BASH_REMATCH[1]},${BASH_REMATCH[2]},$N"
+		elif [[ $line =~ "used disk space: "([^ ]+) ]]; then
+			disk_last_time=$elapsed_time
+			disk_csv+="$elapsed_time,,,${BASH_REMATCH[1]}$N"
+		# memory
+		elif [[ $line =~ "RAM usage: "([^ ]+).+"Swap usage: "([^ ]+) ]]; then
+			memory_last_time=$elapsed_time
+			memory_csv+="$elapsed_time,${BASH_REMATCH[1]},${BASH_REMATCH[2]}$N"
+		# traffic
+		elif [[ $line =~ "received: "([^ ]+).+"sent: "([^ ]+) ]]; then
+			traffic_last_time=$elapsed_time
+			traffic_csv+="$elapsed_time,${BASH_REMATCH[1]},${BASH_REMATCH[2]}$N"
+		fi
+	done < "${LOC[report]}/report.txt"
+	
+	echo "$cpu_csv" > "${LOC[tmp]}/gnuplot:cpu.csv"
+	echo "$disk_csv" > "${LOC[tmp]}/gnuplot:disk.csv"
+	echo "$memory_csv" > "${LOC[tmp]}/gnuplot:memory.csv"
+	echo "$traffic_csv" > "${LOC[tmp]}/gnuplot:traffic.csv"
+	
+	calc_avg_from_raw_data
+	
+	# gnuplot scripts
+	#################
+	
+	line_colors=(
+		"#000000" "#dedede"
+		"#00a1e4" "#246fa9"
+		"#ff5714" "#f5b700"
+		"#dc0073" "#ffadc7"
+	)
+	common=$(cat <<-HEREDOC
+		set datafile separator ','
+		set timefmt "%Y-%m-%d %H:%M:%S"
+		
+		set style line 1 lw $block_line_width lt rgb "${line_colors[0]}" dt 3
+		set style line 2 lw 0.5 lt 1 lc rgb "${line_colors[1]}"
+		set style line 3 lw 2 lt rgb "${line_colors[2]}"
+		set style line 4 lw 2 lt rgb "${line_colors[3]}"
+		set style line 5 lw 2 lt rgb "${line_colors[4]}"
+		set style line 6 lw 2 lt rgb "${line_colors[5]}"
+		set style line 7 lw 2 lt rgb "${line_colors[6]}"
+		set style line 8 lw 2 lt rgb "${line_colors[7]}"
+		
+		set grid xtics, ytics ls 2
+		
+		set key autotitle columnhead
+		set key outside vertical bottom center maxrows 2 height 3
+		
+		set xlabel 'Elapsed time (s)' font 'Rising Sun Bold,12'
+		set xrange [0:]
+		set autoscale xfix
+		set offsets graph 0.01, graph 0.01
+		set xtics
+		
+		set ytics nomirror
+		set ytics
+		
+		set y2tics
+		
+		set terminal pngcairo size 1850,1307 enhanced font 'Rising Sun,11'
+	HEREDOC
+	)
+	common+=$N
+	smooth="smooth mcsplines"
+	
+	# cpu
+	
+	cpu=$common
+	
+	for lt in "${!arrows[@]}"; do
+		if awk "BEGIN {exit !($lt <= $cpu_last_time)}"; then
+			cpu+=${arrows[$lt]}
+		fi
+	done
+	
+	cpu+="set title \"CARI daemon CPU usage and power consumption\" font 'Rising Sun Bold,13'$N"
+	cpu+="set ylabel \"CPU usage (%)\" font 'Rising Sun Bold,12'$N"
+	cpu+="set yrange [0:]$N"
+	cpu+="set format y \"%.2f\"$N"
+	cpu+="set y2label \"CPU power consumption (W)\" font 'Rising Sun Bold,12'$N"
+	cpu+="set y2range [0:]$N"
+	cpu+="set format y2 \"%.2f\"$N"
+	cpu+="set output '${LOC[report]}/img/gnuplot:cpu.png'$N"
+	
+	cpu+="plot '${LOC[tmp]}/gnuplot:cpu.csv' "
+	cpu+="using 1:2 $smooth with lines ls 3,"
+	cpu+="'' using 1:4 $smooth with lines axis x1y2 ls 5,"
+	cpu+="'' u 1:(${AVG[CPU usage]}) with lines ls 4 t 'Avg CPU usage (${AVG[CPU usage unit]})',"
+	cpu+="'' u 1:(${AVG[CPU power consumption]}) with lines axis x1y2 ls 6 t 'Avg CPU power consumption (${AVG[CPU power consumption unit]})',"
+	cpu+="1/0 ls 1 t \"New block\"$N"
+	
+	# disk
+	
+	disk=$common
+	
+	for lt in "${!arrows[@]}"; do
+		if awk "BEGIN {exit !($lt <= $disk_last_time)}"; then
+			disk+=${arrows[$lt]}
+		fi
+	done
+	
+	disk+="set title \"CARI daemon disk usage\" font 'Rising Sun Bold,13'$N"
+	disk+="set ylabel \"Disk traffic (KiB/s)\" font 'Rising Sun Bold,12'$N"
+	disk+="set yrange [0:]$N"
+	disk+="set format y \"%.1f\"$N"
+	disk+="set y2label \"Used disk space (MiB)\" font 'Rising Sun Bold,12'$N"
+	disk+="set y2range [*:*]$N"
+	disk+="set format y2 \"%.5f\"$N"
+	disk+="set key maxrows 3$N"
+	disk+="set output '${LOC[report]}/img/gnuplot:disk.png'$N"
+	
+	disk+="plot '${LOC[tmp]}/gnuplot:disk.csv' "
+	disk+="using 1:2 $smooth with lines ls 3,"
+	disk+="'' using 1:3 $smooth with lines ls 5,"
+	disk+="'' using 1:4 $smooth with lines axis x1y2 ls 7,"
+	disk+="'' u 1:(${AVG[Read from disk]}) with lines ls 4 t 'Avg read from disk (${AVG[Read from disk unit]})',"
+	disk+="'' u 1:(${AVG[Written to disk]}) with lines ls 6 t 'Avg written to disk (${AVG[Written to disk unit]})',"
+	disk+="'' u 1:(${AVG[Used disk space]}) with lines axis x1y2 ls 8 t 'Avg disk space used (${AVG[Used disk space unit]})',"
+	disk+="1/0 ls 1 t \"New block\"$N"
+	
+	# memory
+	
+	memory=$common
+	
+	for lt in "${!arrows[@]}"; do
+		if awk "BEGIN {exit !($lt <= $memory_last_time)}"; then
+			memory+=${arrows[$lt]}
+		fi
+	done
+	
+	memory+="set title \"CARI daemon memory usage\" font 'Rising Sun Bold,13'$N"
+	memory+="set ylabel \"RAM usage (MiB)\" font 'Rising Sun Bold,12'$N"
+	memory+="set yrange [*:*]$N"
+	memory+="set format y \"%.3f\"$N"
+	memory+="set y2label \"Swap usage (MiB)\" font 'Rising Sun Bold,12'$N"
+	memory+="set y2range [0<*:]$N"
+	memory+="set format y2 \"%.3f\"$N"
+	memory+="set output '${LOC[report]}/img/gnuplot:memory.png'$N"
+	
+	memory+="plot '${LOC[tmp]}/gnuplot:memory.csv' "
+	memory+="using 1:2 $smooth with lines ls 3,"
+	memory+="'' using 1:3 $smooth with lines axis x1y2 ls 5,"
+	memory+="'' u 1:(${AVG[RAM usage]}) with lines ls 4 t 'Avg RAM usage (${AVG[RAM usage unit]})',"
+	memory+="'' u 1:(${AVG[Swap usage]}) with lines axis x1y2 ls 6 t 'Avg swap usage (${AVG[Swap usage unit]})',"
+	memory+="1/0 ls 1 t \"New block\"$N"
+	
+	# traffic
+	
+	traffic=$common
+	
+	for lt in "${!arrows[@]}"; do
+		if awk "BEGIN {exit !($lt <= $traffic_last_time)}"; then
+			traffic+=${arrows[$lt]}
+		fi
+	done
+	
+	traffic+="set title \"CARI daemon network traffic\" font 'Rising Sun Bold,13'$N"
+	traffic+="set ylabel \"Network traffic (KiB/s)\" font 'Rising Sun Bold,12'$N"
+	traffic+="set yrange [*:*]$N"
+	traffic+="set format y \"%.1f\"$N"
+	traffic+="unset y2tics$N"
+	traffic+="set output '${LOC[report]}/img/gnuplot:traffic.png'$N"
+	
+	traffic+="plot '${LOC[tmp]}/gnuplot:traffic.csv' "
+	traffic+="using 1:2 $smooth with lines ls 3,"
+	traffic+="'' using 1:3 $smooth with lines ls 5,"
+	traffic+="'' u 1:(${AVG[Network traffic received]}) with lines ls 4 t 'Avg traffic received (${AVG[Network traffic received unit]})',"
+	traffic+="'' u 1:(${AVG[Network traffic sent]}) with lines ls 6 t 'Avg traffic sent (${AVG[Network traffic sent unit]})',"
+	traffic+="1/0 ls 1 t \"New block\"$N"
+	
+	echo "$cpu" > "${LOC[tmp]}/gnuplot:cpu.gnuplot"
+	echo "$disk" > "${LOC[tmp]}/gnuplot:disk.gnuplot"
+	echo "$memory" > "${LOC[tmp]}/gnuplot:memory.gnuplot"
+	echo "$traffic" > "${LOC[tmp]}/gnuplot:traffic.gnuplot"
+	
+	# PNG plots
+	###########
+	
+	parallel gnuplot-nox -p {} ::: "${LOC[tmp]}/gnuplot:"*.gnuplot
+}
+
+# Generate the section of the report related to new blocks on the CARI blockchain.
+generate_report_blocks() {
+	local content new_data time_new_data
+	
+	# ------------------
+	
+	touch "${LOC[tmp]}/raw:blocks.txt"
+	touch "${LOC[tmp]}/report:blocks.txt"
+	
+	while inotifywait -qq -e modify "${LOC[tmp]}/raw:blocks.txt"; do
+		time_new_data=$(date -r "${LOC[tmp]}/raw:blocks.txt" +"${FORMAT[date]}")
+		new_data=$(tail -n 1 "${LOC[tmp]}/raw:blocks.txt")
+		
+		if [[ $new_data == "stop" ]]; then
+			break
+		fi
+		
+		content="$time_new_data: block $new_data"
+		
+		echo "$content" >> "${LOC[tmp]}/report:blocks.txt"
+	done
+}
+
+# Generate the section of the report related to nethogs data.
+generate_report_nethogs() {
+	local content new_data io received sent time_new_data
+	
+	# ------------------
+	
+	touch "${LOC[tmp]}/raw:nethogs.txt"
+	touch "${LOC[tmp]}/report:nethogs.txt"
+	
+	while inotifywait -qq -e modify "${LOC[tmp]}/raw:nethogs.txt"; do
+		time_new_data=$(date -r "${LOC[tmp]}/raw:nethogs.txt" +"${FORMAT[date]}")
+		new_data=$(awk '/^Refreshing:$/ {s=""; next} {s = s $0 RS} END {printf "%s", s}' "${LOC[tmp]}/raw:nethogs.txt")
+		
+		if [[ $new_data =~ "${N}stop"$ ]]; then
+			break
+		fi
+		
+		io=$(grep -oP ".+/${DAEMON_INFO[pid]}/[0-9]\t\K[0-9.]+\t[0-9.]+$" <<< "$new_data")
+		
+		if [[ -n $io ]]; then
+			received=${io%%$'\t'*}
+			sent=${io##*$'\t'}
+		else
+			received="?"
+			sent="?"
+		fi
+		
+		content="$time_new_data: received: $received KiB/s | sent: $sent KiB/s"
+		
+		if [[ ($received != "?" && $sent != "?") || ${SETTINGS[display_unknown]} == true ]]; then
+			echo "$content" >> "${LOC[tmp]}/report:nethogs.txt"
+		fi
+	done
+}
+
+# Generate the report in PDF format.
+generate_report_pdf() {
+	get_report_template > "${LOC[tmp]}/report.html"
+	"${LOC[weasyprint_file]}" "${LOC[tmp]}/report.html" "${LOC[report]}/report.pdf"
+	
+	if command_exists "pdftk"; then
+		pdftk "${LOC[report]}/report.pdf" attach_files "${LOC[report]}/report.txt" output "${LOC[report]}/report2.pdf"
+		
+		if [[ -f "${LOC[report]}/report2.pdf" ]]; then
+			mv "${LOC[report]}/report2.pdf" "${LOC[report]}/report.pdf"
+		fi
+	fi
+}
+
+# Generate the section of the report related to pidstat data.
+generate_report_pidstat() {
+	local content cpu_percent disk_r disk_w new_data time_new_data
+	
+	# ------------------
+	
+	touch "${LOC[tmp]}/raw:pidstat.txt"
+	touch "${LOC[tmp]}/report:pidstat.txt"
+	
+	while inotifywait -qq -e modify "${LOC[tmp]}/raw:pidstat.txt"; do
+		time_new_data=$(date -r "${LOC[tmp]}/raw:pidstat.txt" +"${FORMAT[date]}")
+		new_data=$(tail -n 1 "${LOC[tmp]}/raw:pidstat.txt")
+		
+		if [[ $new_data == "stop" ]]; then
+			break
+		fi
+		
+		if [[ $new_data =~ ^[0-2] ]]; then
+			new_data=$(awk '{print $8, $10, $11}' <<< "$new_data")
+			cpu_percent=${new_data%% *}
+			disk_r=${new_data% *}
+			disk_r=${disk_r%% *}
+			disk_w=${new_data##* }
+			content="$time_new_data: CPU usage: ${cpu_percent}% ($(float_calc "$cpu_percent * ${HOST_INFO[avg_cpu_speed]} / 100" 0) MHz)$N"
+			content+="$time_new_data: read: $disk_r KiB/s | written: $disk_w KiB/s$N"
+			
+			echo -n "$content" >> "${LOC[tmp]}/report:pidstat.txt"
+		fi
+	done
+}
+
+# Generate the section of the report related to scaphandre data.
+generate_report_scaphandre() {
+	local content host_cons new_data process_cons time_new_data
+	
+	# ------------------
+	
+	touch "${LOC[tmp]}/raw:scaphandre.txt"
+	touch "${LOC[tmp]}/report:scaphandre.txt"
+	
+	while inotifywait -qq -e modify "${LOC[tmp]}/raw:scaphandre.txt"; do
+		time_new_data=$(date -r "${LOC[tmp]}/raw:scaphandre.txt" +"${FORMAT[date]}")
+		new_data=$(tail -n 9 "${LOC[tmp]}/raw:scaphandre.txt")
+		
+		if [[ $new_data =~ "${N}stop"$ ]]; then
+			break
+		fi
+		
+		host_cons=$(grep -oP "^Host:\t\K[0-9]+\.[0-9]+(?= W)" <<< "$new_data")
+		
+		if [[ -z $host_cons ]]; then
+			host_cons="?"
+		fi
+		
+		process_cons=$(grep -oP "^[0-9]+(\.[0-9]+)?(?= W\t${DAEMON_INFO[pid]})" <<< "$new_data")
+		
+		if [[ -z $process_cons ]]; then
+			process_cons="?"
+		fi
+		
+		content="$time_new_data: CPU power consumption: $process_cons W (host: $host_cons W)"
+		
+		if [[ $process_cons != "?" || ${SETTINGS[display_unknown]} == true ]]; then
+			echo "$content" >> "${LOC[tmp]}/report:scaphandre.txt"
+		fi
+	done
+}
+
+# Get the block count.
+get_block_count() {
+	local type=$1
+	
+	local block_count
+	
+	# ------------------
+	
+	if [[ $type == "blockchain" ]]; then
+		block_count=$(wget -qO- "${LOC[bc1_url]}")
+		
+		if ! is pos_int "$block_count"; then
+			block_count=$(wget -qO- "${LOC[bc2_url]}")
+		fi
+	elif [[ $type == "local" ]]; then
+		block_count=$("${LOC[cli_file]}" -conf="${LOC[wallet_data]}/cari.conf" -datadir="${LOC[wallet_data]}" getblockcount 2> /dev/null)
+	fi
+	
+	if ! is pos_int "$block_count"; then
+		block_count="?"
+	fi
+	
+	echo -n "$block_count"
+}
+
+# Get value from "some key: some value" entries.
+get_colon_value() {
+	local entries=$1
+	local key=$2
+	local return_complete_value=$3
+	local include_duplicates=$4
+	
+	local pattern value
+	
+	if ! is bool "$return_complete_value"; then
+		return_complete_value=true
+	fi
+	
+	if ! is bool "$include_duplicates"; then
+		include_duplicates=false
+	fi
+	
+	# ------------------
+	
+	pattern="^\s+$key:\s+\K"
+	
+	if [[ $return_complete_value == true ]]; then
+		pattern+=".+"
+	else
+		pattern+="[^ ]+"
+	fi
+	
+	value=$(grep -oP "$pattern" <<< "$entries")
+	
+	if [[ $include_duplicates == false ]]; then
+		value=$(echo -n "$value" | uniq)
+	fi
+	
+	echo -n "$value" | sed -z "s/\n/ | /g"
+}
+
+# Get information about the CARI daemon. The global variable DAEMON_INFO will be updated.
+get_daemon_info() {
+	local daemon_pid=$1
+	
+	local cmd_indentation cmd_label escaped_script_dir output
+	
+	# ------------------
+	
+	if is pos_int "$daemon_pid"; then
+		DAEMON_INFO[pid]=$daemon_pid
+		DAEMON_INFO[command]=$(tr '\000' ' ' < "/proc/${DAEMON_INFO[pid]}/cmdline" | trim)
+	else
+		output=$(pgrep -a carid | head -n 1)
+		DAEMON_INFO[pid]=${output%% *}
+		DAEMON_INFO[command]=${output#* }
+	fi
+	
+	if [[ -z ${DAEMON_INFO[command]} ]]; then
+		DAEMON_INFO[command]="not found"
+	fi
+	
+	DAEMON_INFO[running_time]=
+	
+	if is pos_int "${DAEMON_INFO[pid]}"; then
+		DAEMON_INFO[running_time]=$(ps -o etime= -p "${DAEMON_INFO[pid]}" | \
+		                            sed -E "s/^\s+//; s/:([0-9]{2}$)/m \1s/; s/:([0-9]{2}m)/h \1/; s/^([0-9]+)-/\1d /;")
+	else
+		DAEMON_INFO[pid]="not found"
+	fi
+	
+	if [[ -z ${DAEMON_INFO[running_time]} ]]; then
+		DAEMON_INFO[running_time]="not found"
+	fi
+	
+	cmd_label="  - Command: "
+	cmd_indentation=$(repeat_char " " "${#cmd_label}")
+	escaped_script_dir=$(escape_sed "${LOC[script]}/" "pattern")
+	
+	DAEMON_INFO[text]="+ CARI daemon information:$N"
+	DAEMON_INFO[text]+="  - PID: ${DAEMON_INFO[pid]}$N"
+	DAEMON_INFO[text]+="  - Running time: ${DAEMON_INFO[running_time]}$N"
+	DAEMON_INFO[text]+=$cmd_label$(echo -n "${DAEMON_INFO[command]}" | sed -E "s/$escaped_script_dir//g" | \
+	                               fold -s -w "$((FORMAT[max_width] - ${#cmd_label}))" | \
+	                               sed -Ez "s/\n/\n$cmd_indentation/g")$N
+}
+
+# Get du data (disk space).
+get_du_data() {
+	local duration disk_space_b disk_space_mib time
+	
+	# ------------------
+	
+	duration=0
+	
+	while true; do
+		time=$(date +"${FORMAT[date]}")
+		disk_space_b=$(du -bs "${LOC[wallet_data]}" | cut -d $'\t' -f 1)
+		disk_space_mib=$(float_calc "$disk_space_b / 1024 / 1024" 5)
+		echo "$time: used disk space: $disk_space_mib MiB" >> "${LOC[tmp]}/report:du.txt"
+		
+		sleep "${SETTINGS[step_duration]}"
+		duration=$((duration + SETTINGS[step_duration]))
+		
+		if ((duration >= SETTINGS[total_duration])); then
+			break
+		fi
+	done
+}
+
+# Get information about the host machine. The global variable HOST_INFO will be updated.
+get_host_info() {
+	local output output2 threads_per_core
+	
+	# ------------------
+	
+	unset HOST_INFO
+	declare -Ag HOST_INFO
+	
+	# Architecture (ex.: x86_64)
+	############################
+	
+	if [[ -n $HOSTTYPE ]]; then
+		HOST_INFO[arch]=$HOSTTYPE
+	fi
+	
+	if [[ -z ${HOST_INFO[arch]} ]]; then
+		HOST_INFO[arch]=$(uname -m)
+	fi
+	
+	HOST_INFO[arch]=${HOST_INFO[arch]/-/_}
+	
+	# CPU model (ex.: AMD EPYC 7451 24-Core Processor)
+	##################################################
+	
+	if [[ -f /proc/cpuinfo ]]; then
+		HOST_INFO[cpu]=$(awk -F ': *' '/model name/ {print $2; exit}' /proc/cpuinfo)
+	fi
+	
+	# Current CPU speed in MHz (ex.: 3400)
+	######################################
+	
+	output=$(dmidecode -t "processor")
+	HOST_INFO[current_cpu_speed]=$(get_colon_value "$output" "Current Speed" false)
+	
+	# Max CPU speed in MHz (ex.: 3800)
+	##################################
+	
+	HOST_INFO[max_cpu_speed]=$(get_colon_value "$output" "Max Speed" false)
+	
+	# Average CPU speed in MHz (ex.: 3600)
+	######################################
+	
+	HOST_INFO[avg_cpu_speed]=$(float_calc "(${HOST_INFO[current_cpu_speed]} + ${HOST_INFO[max_cpu_speed]}) / 2" 0)
+	
+	# Number of cores (ex.: 4)
+	##########################
+	
+	if [[ -f /proc/cpuinfo ]]; then
+		HOST_INFO[cpu_cores]=$(awk -F ': *' '/cpu cores/ {print $2; exit}' /proc/cpuinfo)
+	fi
+	
+	# Number of threads (ex.: 4)
+	############################
+	
+	if is pos_int "${HOST_INFO[cpu_cores]}"; then
+		threads_per_core=$(lscpu | awk -F ': *' '/Thread\(s\) per core/ {print $2}')
+		
+		if is pos_int "$threads_per_core"; then
+			HOST_INFO[cpu_threads]=$((threads_per_core * HOST_INFO[cpu_cores]))
+		fi
+	fi
+	
+	# Mountpoint where the script directory is (ex.: /)
+	###################################################
+	
+	HOST_INFO[mountpoint]=$(findmnt -n -o TARGET -T "${LOC[script]}")
+	
+	# Source device where the script directory is (ex.: /dev/sda)
+	#############################################################
+	
+	HOST_INFO[source_device]=$(lsblk -p -i | awk -v mp="${HOST_INFO[mountpoint]}" '/^\// {device=$1} $NF == mp {print device}')
+	
+	# Name of the source device where the script directory is (ex.: sda)
+	####################################################################
+	
+	HOST_INFO[source_device_name]=${HOST_INFO[source_device]##*/}
+	
+	# Disk vendor (ex.: ATA)
+	########################
+	
+	output=$(smartctl -i "${HOST_INFO[source_device]}")
+	HOST_INFO[disk_vendor]=$(get_colon_value "$output" "Vendor")
+	
+	if [[ -z ${HOST_INFO[disk_vendor]} && -f "/sys/class/block/${HOST_INFO[source_device_name]}/device/vendor" ]]; then
+		HOST_INFO[disk_vendor]=$(trim < "/sys/class/block/${HOST_INFO[source_device_name]}/device/vendor")
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_vendor]} ]] && command_exists "lsblk"; then
+		HOST_INFO[disk_vendor]=$(lsblk -o NAME,VENDOR -p | awk -v device="${HOST_INFO[source_device]}" '$1 == device {print $2}')
+	fi
+	
+	# Disk model (ex.: Samsung SSD 850)
+	###################################
+	
+	HOST_INFO[disk_model]=$(get_colon_value "$output" "Device Model")
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]]; then
+		HOST_INFO[disk_model]=$(get_colon_value "$output" "Product")
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]]; then
+		HOST_INFO[disk_model]=$(lshw -quiet -sanitize -short -C disk | awk -v device="${HOST_INFO[source_device]}" '$2 == device {for (i=4; i<NF; i++) printf $i " "; print $NF}')
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} && -f "/sys/class/block/${HOST_INFO[source_device_name]}/device/model" ]]; then
+		HOST_INFO[disk_model]=$(trim < "/sys/class/block/${HOST_INFO[source_device_name]}/device/model")
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]] && command_exists "lsblk"; then
+		HOST_INFO[disk_model]=$(lsblk -o NAME,MODEL -p | awk -v device="${HOST_INFO[source_device]}" '$1 == device {print $2}')
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]] && command_exists "hdparm"; then
+		HOST_INFO[disk_model]=$(get_colon_value "$(hdparm -I "${HOST_INFO[source_device]}")" "Model Number")
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]] && command_exists "hwinfo"; then
+		HOST_INFO[disk_model]=$(hwinfo --disk --short | awk -v device="${HOST_INFO[source_device]}" '$1 == device {for (i=2; i<NF; i++) printf $i " "; print $NF}')
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]] && command_exists "udisksctl"; then
+		HOST_INFO[disk_model]=$(udisksctl status | awk -v device="${HOST_INFO[source_device_name]}" '$NF == device {NF-=3; print}')
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_model]} ]] && command_exists "sg_vpd"; then
+		HOST_INFO[disk_model]=$(get_colon_value "$(sg_vpd -pai "${HOST_INFO[source_device]}")" "model")
+	fi
+	
+	# Disk type (ex. : SSD)
+	#######################
+	
+	output2=$(get_colon_value "$output" "Model Family")
+	
+	if [[ $output2 =~ "HDD" ]]; then
+		HOST_INFO[disk_type]="HDD"
+	elif [[ $output2 =~ "SSD" ]]; then
+		HOST_INFO[disk_type]="SSD"
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_type]} && -f "/sys/block/${HOST_INFO[source_device_name]}/queue/rotational" ]]; then
+		output2=$(trim < "/sys/block/${HOST_INFO[source_device_name]}/queue/rotational")
+		
+		if [[ $output2 == 0 ]]; then
+			HOST_INFO[disk_type]="SSD"
+		elif [[ $output2 == 1 ]]; then
+			HOST_INFO[disk_type]="HDD"
+		fi
+	fi
+	
+	if [[ -z ${HOST_INFO[disk_type]} ]] && command_exists "lsblk"; then
+		output2=$(lsblk -o NAME,ROTA -p | awk -v device="${HOST_INFO[source_device]}" '$1 == device {print $2}')
+		
+		if [[ $output2 == 0 ]]; then
+			HOST_INFO[disk_type]="SSD"
+		elif [[ $output2 == 1 ]]; then
+			HOST_INFO[disk_type]="HDD"
+		fi
+	fi
+	
+	# Network card vendor (ex.: Intel Corporation)
+	##############################################
+	
+	output=$(lshw -quiet -sanitize -C network)
+	HOST_INFO[network_card_vendor]=$(get_colon_value "$output" "vendor")
+	
+	# Network card model (ex.: Ethernet Connection (7) I219-LM)
+	###########################################################
+	
+	HOST_INFO[network_card_model]=$(get_colon_value "$output" "product")
+	
+	if [[ -z ${HOST_INFO[network_card_model]} ]] && command_exists "lspci"; then
+		HOST_INFO[network_card_model]=$(lspci | grep -i Ethernet)
+	fi
+	
+	# Current network card speed in MiB/s (ex.: 125)
+	################################################
+	
+	HOST_INFO[current_network_card_speed]=$(get_network_card_speed_in_mib_s "$(get_colon_value "$output" "size")")
+	
+	# Max network card speed in MiB/s (ex.: 125)
+	############################################
+	
+	HOST_INFO[max_network_card_speed]=$(get_network_card_speed_in_mib_s "$(get_colon_value "$output" "capacity")")
+	
+	# Network interface (ex.: eth0)
+	###############################
+	
+	HOST_INFO[network_interface]=$(route | awk '/^default/ {print $NF}')
+	
+	# GUI (ex.: true)
+	#################
+	
+	if [[ -n $DISPLAY || -n $XDG_CURRENT_DESKTOP ]] || grep -q '[W]indowServer' <(ps -fe); then
+		HOST_INFO[gui]=true
+	else
+		HOST_INFO[gui]=false
+	fi
+	
+	# Kernel (ex.: Linux)
+	#####################
+	
+	HOST_INFO[kernel]=$(uname -s)
+	
+	# Kernel version (ex.: 5.4.0-74-generic)
+	########################################
+	
+	HOST_INFO[kernel_version]=$(uname -r)
+	
+	# Number of RAM modules (ex.: 2)
+	################################
+	
+	output=$(dmidecode -t "memory")
+	HOST_INFO[ram_modules]=$(get_colon_value "$output" "Number Of Devices")
+	
+	# RAM type (ex.: DDR3)
+	######################
+	
+	HOST_INFO[ram_type]=$(get_colon_value "$output" "Type")
+	
+	# RAM speed of each RAM module (ex.: 1600 MT/s | 1600 MT/s)
+	###########################################################
+	
+	HOST_INFO[ram_speed_detailed]=$(get_colon_value "$output" "Speed" "" true)
+	
+	# RAM size of each RAM module (ex.: 1 GB | 1 GB)
+	################################################
+	
+	HOST_INFO[ram_size_detailed]=$(get_colon_value "$output" "Size" "" true)
+	
+	# Total RAM size in MiB (ex.: 2048)
+	###################################
+	
+	HOST_INFO[ram_size]=$(free -m | awk '/^Mem:/{print $2}')
+	
+	# Swap size in MiB (ex.: 2048)
+	##############################
+	
+	HOST_INFO[swap_size]=$(free -m | awk '/^Swap:/{print $2}')
+	
+	if [[ -z ${HOST_INFO[swap_size]} ]]; then
+		HOST_INFO[swap_size]=0
+	fi
+	
+	# Operating system (ex.: Ubuntu)
+	################################
+	
+	if [[ -f /etc/os-release ]]; then
+		HOST_INFO[os]=$(sed -En 's/^NAME="([^"]+)"$/\1/p' /etc/os-release)
+	fi
+	
+	if [[ -z ${HOST_INFO[os]} ]] && command_exists hostnamectl; then
+		HOST_INFO[os]=$(hostnamectl | awk -F ': ' '/Operating System/ {print $2}')
+		HOST_INFO[os]=${HOST_INFO[os]% *}
+	fi
+	
+	# OS version (ex.: 20.04)
+	#########################
+	
+	if [[ -f /etc/os-release ]]; then
+		HOST_INFO[os_version]=$(sed -En 's/^VERSION_ID="([^"]+)"$/\1/p' /etc/os-release)
+	fi
+	
+	if [[ -z ${HOST_INFO[os_version]} ]] && command_exists hostnamectl; then
+		HOST_INFO[os_version]=$(hostnamectl | awk -F ': ' '/Operating System/ {print $2}')
+		HOST_INFO[os_version]=${HOST_INFO[os_version]##* }
+	fi
+	
+	# Main OS version (ex.: 20)
+	###########################
+	
+	HOST_INFO[main_os_version]=${HOST_INFO[os_version]%%.*}
+	
+	# Virtualization (ex.: oracle)
+	##############################
+	
+	if command_exists systemd-detect-virt; then
+		HOST_INFO[virt]=$(systemd-detect-virt || :)
+	fi
+	
+	if [[ -z ${HOST_INFO[virt]} ]] && command_exists hostnamectl; then
+		HOST_INFO[virt]=$(hostnamectl | awk -F ': *' '/Virtualization: /{print $2}')
+		
+		if [[ -z ${HOST_INFO[virt]} ]]; then
+			HOST_INFO[virt]="none"
+		fi
+	fi
+	
+	if [[ -z ${HOST_INFO[virt]} ]] && is user root && command_exists virt-what; then
+		HOST_INFO[virt]=$(virt-what)
+		HOST_INFO[virt]=${HOST_INFO[virt]//$N/ }
+	fi
+	
+	# Text
+	######
+	
+	# Host
+	
+	HOST_INFO[text]="+ Host information:$N"
+	HOST_INFO[text]+="  - Operating system: ${HOST_INFO[os]} ${HOST_INFO[os_version]}$N"
+	HOST_INFO[text]+="  - Kernel: ${HOST_INFO[kernel]} ${HOST_INFO[kernel_version]} (${HOST_INFO[arch]})$N"
+	HOST_INFO[text]+="  - Virtualization: ${HOST_INFO[virt]}$N"
+	
+	# CPU
+	
+	HOST_INFO[text]+="${FORMAT[sep2]}${N}+ CPU information:$N"
+	HOST_INFO[text]+="  - Model: ${HOST_INFO[cpu]}$N"
+	HOST_INFO[text]+="  - Speed: current: ${HOST_INFO[current_cpu_speed]} MHz | max: ${HOST_INFO[max_cpu_speed]} MHz | average: ${HOST_INFO[avg_cpu_speed]} MHz$N"
+	HOST_INFO[text]+="  - Components: ${HOST_INFO[cpu_cores]} cores | ${HOST_INFO[cpu_threads]} threads$N"
+	
+	# Memory
+	
+	HOST_INFO[text]+="${FORMAT[sep2]}${N}+ Memory information:$N"
+	HOST_INFO[text]+="  - Number of RAM modules: ${HOST_INFO[ram_modules]} (${HOST_INFO[ram_type]})$N"
+	HOST_INFO[text]+="  - RAM speed: ${HOST_INFO[ram_speed_detailed]}$N"
+	HOST_INFO[text]+="  - RAM size: ${HOST_INFO[ram_size]} MiB"
+	
+	if ((HOST_INFO[ram_modules] > 1)); then
+		HOST_INFO[text]+=" (${HOST_INFO[ram_size_detailed]})"
+	fi
+	
+	HOST_INFO[text]+=$N
+	HOST_INFO[text]+="  - Swap size: ${HOST_INFO[swap_size]} MiB$N"
+	
+	# Disk
+	
+	HOST_INFO[text]+="${FORMAT[sep2]}${N}+ Disk information:$N"
+	HOST_INFO[text]+="  - Model: ${HOST_INFO[disk_model]}"
+	
+	if [[ -n ${HOST_INFO[disk_vendor]} ]]; then
+		HOST_INFO[text]+=" (${HOST_INFO[disk_vendor]})"
+	fi
+	
+	HOST_INFO[text]+=$N
+	HOST_INFO[text]+="  - Type: ${HOST_INFO[disk_type]}"
+	
+	if [[ -z ${HOST_INFO[disk_type]} ]]; then
+		HOST_INFO[text]+="unknown"
+	elif [[ ${HOST_INFO[virt]} != "none" ]]; then
+		HOST_INFO[text]+="(may not be accurate because of virtualization)"
+	fi
+	
+	HOST_INFO[text]+=$N
+	
+	# Network
+	
+	HOST_INFO[text]+="${FORMAT[sep2]}${N}+ Network information:$N"
+	HOST_INFO[text]+="  - Card model: ${HOST_INFO[network_card_model]}"
+	
+	if [[ -n ${HOST_INFO[network_card_vendor]} ]]; then
+		HOST_INFO[text]+=" (${HOST_INFO[network_card_vendor]})"
+	fi
+	
+	HOST_INFO[text]+=$N
+	HOST_INFO[text]+="  - Card speed: current: ${HOST_INFO[current_network_card_speed]} MiB/s | max: ${HOST_INFO[max_network_card_speed]} MiB/s$N"
+}
+
+# Get the specified network card speed in MiB/s.
+get_network_card_speed_in_mib_s() {
+	local raw_speed=$1
+	
+	local speed_mib_s
+	
+	# ------------------
+	
+	if [[ $raw_speed =~ ^([1-9]+[0-9]*)([A-Za-z]+)"/s"$ ]]; then
+		if [[ ${BASH_REMATCH[2]} == "Mbit" ]]; then
+			speed_mib_s=$(float_calc "${BASH_REMATCH[1]} / 8" 0)
+		elif [[ ${BASH_REMATCH[2]} == "Gbit" ]]; then
+			speed_mib_s=$(float_calc "${BASH_REMATCH[1]} * 125" 0)
+		fi
+	fi
+	
+	if [[ -z $speed_mib_s ]]; then
+		speed_mib_s="unknown"
+	fi
+	
+	echo -n "$speed_mib_s"
+}
+
+# Get proc status data (RAM and swap usage).
+get_proc_status_data() {
+	local duration proc_status_file ram_mib swap_mib time
+	
+	# ------------------
+	
+	duration=0
+	
+	while true; do
+		proc_status_file="/proc/${DAEMON_INFO[pid]}/status"
+		
+		if [[ -f $proc_status_file ]]; then
+			time=$(date +"${FORMAT[date]}")
+			ram_mib=$(awk "/VmRSS/{printf \"%.5f\", \$2 / 1024}" "$proc_status_file")
+			swap_mib=$(awk "/VmSwap/{printf \"%.5f\", \$2 / 1024}" "$proc_status_file")
+			
+			echo "$time: RAM usage: $ram_mib MiB | Swap usage: $swap_mib MiB" >> "${LOC[tmp]}/report:proc-status.txt"
+		fi
+		
+		sleep "${SETTINGS[step_duration]}"
+		duration=$((duration + SETTINGS[step_duration]))
+		
+		if ((duration >= SETTINGS[total_duration])); then
+			break
+		fi
+	done
+}
+
+# Get the report template in HTML.
+get_report_template() {
+	local count line logo raw_specs report_date step_text title total_duration
+	
+	# ------------------
+	
+	logo="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMgAAAELCAYAAACcU8kwAABIuElEQVR42u"
+	logo+="2dB3xb1fX4VdB7coAuWvYepaWUEZx4x5YTzzh2PCIpjLILtMzCv8CvhTZlpoUyUiBxvLctT+nZ8ohjxy"
+	logo+="t2HMfbAUpZKRlAEiCELDvW/5wn2fGQ9O5bsmy/8/mcj5zY0hu633fvOfcMlUoR6cWq+kG4afWFoSZ9oN"
+	logo+="akvz3EpH9Oyxj+rTUbCrVmXWOIWdcXYjZ8hKo16/eBHrSrVcvoT7A/M/o97O8ZfT/8uwW0HP6dDJ/3gt"
+	logo+="akewz+P15bpbtJWx7/E+WGK+KxsqQ08QIYuNEAw1OhZkN2iFm/AwbzUXawu0+/Bu0CaDJDGN2fQiv1kV"
+	logo+="pL4sXKt6OIW0XbqFVrTasXARCPhJr1+TAjfOpmEPjqXpixKmAG+z8ts1qrNerOUr5FRaSFokp3fihjuC"
+	logo+="OU0RvHl0GzV0fYmcasX6ut0IdFW6I1yjesCG+BGWIxDKJXQd+f5UBw6XegJWgnBVXe+lPlm1fEqQSbVi"
+	logo+="9kn6xm/cdzHArHis4BRr8Jlo0PKLAowsqysoSfhTK6J2BQvDcvoXCux0LMutJQs2GlzqijlZEyz1ywoW"
+	logo+="ZdCCyj8nAgKDBw6lchjP4fwWbdFcrgmcOCBil80b9TZgthGmLWn4QlWCW6tPEho4youeKFMurOYjfWTP"
+	logo+="r/KQNdMh1Az5538v2UMsJmsX0BT7u/w5PvgDKgZdNPYFZ5SHEXzyJBo5KdMWy7y8ogdo/uArvuftxIVU"
+	logo+="agp8qaNaexcU9m/WfKgJ0xfT/UrNcrNoqn7WGYdUtDTLodc8AQPo679XbID9p/Pj4Lr6UF95WUkTnDEl"
+	logo+="CWcG6IaVU+wGFFhRnEEwfLUa1ZNwgDvQp+3gA//yXErPvtUpM+OJhJ+gUGFeLG3BqYAV06G2D5gn8Hy8"
+	logo+="erQypXLwlldLfa9nD0b4AdUGAPkjzmSV4vNvqYueXnykidiVmjYtUdIRWr9odUABwVHgPIfttutP5VLW"
+	logo+="O4LdR8y3XuXJfjsZZV6H6tZXSGUEb/ss0tq/9ihkE5gB4vZcS6bzl1RXD5qlpQawjqDALCDj54egMM94"
+	logo+="VVJl3psRujjOFGnG3ss9h3MwKLSV+jLV99uTKCZfyig8qSHg0uTTqMcMwIIBivhF+02fB4cIXu+tlojO"
+	logo+="LeBcwwQba4M7eH638H39PvFSNehj2NJSVJzJKyJGswq24FBEPEW9F1HAE2z1y7t6GVOm+YWd6yZza6bT"
+	logo+="bBRDNlZEsgIcWrlsDN/N+S0iQrqhsBacHI1iUW3Tnz4T6j/YJhJBikyIaVuCOZy6SLUka4mCVVSdJjS0"
+	logo+="oST4Ba3QTIUUybxTX7fL71aE/ZZ5XDMkMyiks9nVF3ujLgebpvg4yJm4IQjDF1AEiwRICEmPQf4BIqzK"
+	logo+="j7sbuvFV23y6oM14QwOv9Qky4GPT4wOP/IFmew5afY1KRfA69P29TwABZtwKIQ+F65zjuyRnc2puvC+e"
+	logo+="yW19mhq8VltDLyCWSJceWvg4oTPwa1osoJCHzx20IYfazcRqO/UbcAZ6UQk0GH+yBw7Bw8tsThMPuxYg"
+	logo+="oc5100hHGfBY8rxflj+A5CK3Nc2yfK5iIXHMXxywKNCV8HGROsMgPSyoIhkyxldBdhyIV9mYI54MMzlf"
+	logo+="gEuiXUrPsreq7ERt+yG5W2GU2uqi2HYRaNU0hwtKwqXHl3YFHCiUCEgwUkQQ5AZAEDa2Cxyx6YGdgIVw"
+	logo+="9OfoJ79PbSitUBYmbN4IrVl6CtZrchJPcahjL6RxUiJhjjgUXxL4NaARCrLICY9D2hzOplkq/PMQGL0T"
+	logo+="e4yesjtX4Ms8ozYkJB7PspH8pxfjADvz7v90twyoeZoyCwEOFwDEgQL0B0Uzf29oAhew9XnBPxgMDkK8"
+	logo+="ZwG6z1mVkaROjEc6dPxxgvIfcklok9A96/TqbZJEWq725WwhFYsLIsAOGQGBAYvN/jWjnactuPJAEDS3"
+	logo+="zCl2X/3Dlb1QQeJhuFVmRky6yaDf+R4bwK5l3m4nVGHR1QEF8RULDSOhmQeNGAwLLHhGtkKQBmvU624M"
+	logo+="P5lHv+PbqUhVQzCTTF/ZCN4JV+571s3kCCcPiPwSEtIPtCK1aJjhplDW7cc4Dl2TxPfupl482EzCaM7l"
+	logo+="Z4/xGJbZL0+TFz5MeZ/PPtcNgBCRAHyChottiNJow0xWWUvbq6kh04Zp+gR0mAsbyUMdwsdXYn1kSes3"
+	logo+="BoM7Re/nlxNf75cVYJAfkwtEwXIua8cDlm369QamQ5e3ozemNE7W/PFOb+1rdLeC7DWFN47tGxZs1pAE"
+	logo+="YxAGKVDJCyVVm45hUDBiyl1s8Sb9RRe2g6tjhowIrt7D6ESf82nP9Lp0JQ7Mron50QpvIGuz+DYfomfQ"
+	logo+="/8/LnAh0Hv0qrEy/jeZ6x4wnrJJE1Km2NZin55cf9i4XAIyEq+gHy7pDzpdqHnssx0y3k4sDxlxrClps"
+	logo+="JShB34+hTc9Q5hDHdjZK220vAbuWKUcFecLdJt0t8O8L1Ikn2IMVnC7RL985LdM0afNnfgyF3xoF9urN"
+	logo+="VPGkA6hfrr2SeZSf8UfMnfzhAMw7ZuUYYMTLjCwEQtk/QrT6spxdpitq5YWU6CFL9Gl66gz7bNcJJEAW"
+	logo+="P52FkPh39ObDzAcVICQEaDypJeEZrfjfE9MDj/6/bmNZiOa9I9jJG6uKE2K23HKt1NtmXcpD2OQ2y4ip"
+	logo+="Dvwqz/s1Retlm90744N3axX07sYRYOcYB8t6Q0cZWgL9eSeDH29nMTEAcx2QiBwMIJct1XzJ3AJC7M2R"
+	logo+="hTPB5mBo4pLCNvwP8fq5gixMB2JPa+KSkYVIgzcWjFal9B34tJ/6Q0O++GFbMSjoDM6Kt8clZ8CYBYRQ"
+	logo+="LyUbBxJe81L4YnoHsSn3Ryl95ED9hSs26pFNVLsCEntnjTmgyr0dBmd7ZtgLfYi25/JUHDnA9hRmvDzT"
+	logo+="es2g4G/71YRohPezbMP8FlIpYzQiCFQcJWvxSdujsr3bm+2St6fXNWWJ0DEucSEBsk8Zt8BBioS8sNV9"
+	logo+="m7wspkVLPdaf+OSw/BS0+jbgEuUWwQo02i3wr65Uy3Z8PaWgg8huqji5bErkOYhToSMCBRdL2AKt35s8"
+	logo+="soz1rxbwDEKgqQovg3eD+RYT2KhZRlSRNl9N+wT3NGFyRk3cvWx7KFw+PypHcG80P46oc2j59hhbbxLi"
+	logo+="/JH6bYFNWsHxDn0TLcPXvgyIyJAzhGRQAyGmBMeEKI6xbTNmUYIK3wRL2F7+DAhCkYWHey+w9zJ2QFsx"
+	logo+="83CLU7XNg10SIfXpmzw2OVteIin6yYr1g4hAEyHFSUcA/vp1CFPszW7li6TTn0s/NJ/0Sbx54bgZtyO+"
+	logo+="f87jqs/YXaHg5nflFJZrpuz6cDLhLgaAC1CgTkO/+ilZF8vTm4wSVhstKXrAuScJcWoWBr5Jr16+Quau"
+	logo+="ChOoqRCFK4r201i4U7HjyeD5+MFQ8iHK4BiZ0EiP84IHFfBhQmLuZzPDabT7ol1T50O5K6QnFmmcdQOF"
+	logo+="ji6DrEhn6Emg1/EHMOUhWnkGe/Iz3iEp/MmG8FArIPq5jwC1kw3IieJAlCPHajq5Hk5rJ5Dmx/Q912BQ"
+	logo+="qH2i5mkLJ2nojje3TJIJ/M5ZUAiFUAIF8E5sdex9MtmCRBVt9hjHciWRrgnoQ9AeiQAgGnsfya4CUWm8"
+	logo+="Ys/Nge29d9cXrM7QCIVQAgX/rn8tsAxGWQGHuDDQoE45vTv88ajYYVcu6lzAGtdlAlflhoq2gsTiem6Z"
+	logo+="BH5q0vTI8+Z3Hm8q9cAeLrAJCA/Liv+MCBxjjchHdELqeauDb2WJ88RrayAYUKBC50Ld4vfNDYi99NjL"
+	logo+="L9h7AZRF8gItzkPx5qmC/fsDgD4XAFyIopgMQeCCpcQVz3FvcfMMdcjO8em0u62tzDY2D8lIfXs/KUxK"
+	logo+="mXp0YE2NpBnOpRKCQsSGQUQZ3HwbEoNeY3AMcIT0CO+ubHBpEeAw1je46E0BtX4qrEvs1NrLsLO7Qqg5"
+	logo+="8gDIXR/cn5A8YGCS5j+RrrWOFd5OrgHQ+0PaJrEA4egJwEOJKId8bLEn4GF98ptOsTfJkJLte8jD4WA+"
+	logo+="2UgU+WwbeUMURwzvS27lXW4ErDtTyXV5Ui3cyrPGv2yIhaDoBYxwBZTACIb07cY6Sfj01qhA5edm/ERf"
+	logo+="Aa5mXAE6tZGfTE2klqeOOMjAlpfDxK9ugDUdmYHpV+izdhUXr0gGtAYiYB4psb90/Sz8c8B0FGsq012h"
+	logo+="pn3gzbxiLrrh1VBj2RYsmep+Xs28HWHbN15hVxnrrtHjV7eKdH/34RwkEKSPaKQtLoV/uyqleIF8Np3B"
+	logo+="Qb4Wu4T+ay/XNtP6NSqLuWX3iJ4RUJUg/+7jlwJMeesSgteh8PQHrxPUQ3CxOFzLpuIUFzzqZ0LHjA9h"
+	logo+="ZUBj25KxzD+d0gmG8ixWyOzYM8x/ZIj/ojAGIlBOTA4rwYorbINlchf7sgxGT4l6MlAJbMtPcIVwrAEQ"
+	logo+="Qcot0WYtKFu2sc2cPbRVeUwaxIj4EDB/GitKg9hICM+GTHEEXmso0j+e9zHMNcC4fLtArdrwXNRPPQM4"
+	logo+="WhIUIrxAheVmEqsVTNdxh9vOcsr9KiHwFArM4BWT4BkOXPEH0oNrjnX1Dsawwxd/RZWJZS6nqwcw4Ksy"
+	logo+="EVn+BCClOLETY116x/VSonCcx6fR4TXoLLGO/UqI84AYFZxDcrppTUKLc3peRVRsdR91lbyIMs2YSzXd"
+	logo+="n2a/Ck/Rv2K5SiqIQge4NZvUxsWq1H18S6OSUqEQCxOgVkfLNw+a6bMuJ/wiO8mc/T5GNHy4HQSn2k7c"
+	logo+="k47w3sA+jyxLx5bOCJ+z0zmSOBLtxQkyFRZCSEs47EWZKdaGW/+ChggKOFAJCTPunRSwnde3781qG6wW"
+	logo+="kRuKz7VvcMW9ViHoR52MNhWmDWzbU7IB6E1+VsMQge5XrkFKzDhXFvWOha4u69kyrKSNUUCYWqGbxPVd"
+	logo+="snvGbYotTohQiHQ0DSJwFCFMUZxuguZTP4ePQvx4IMkwDDNmgmffFc6+5kq1yos2C2IpYDQgDQjelue4"
+	logo+="E4HAgdIlg10qwrdcc+E+YBEeXBG42nq0zvExU111gGH6csg78TPnukRK6fBkjaGCBjs0j0jusIvkT8ot"
+	logo+="n0TPIb8hkCNfEzgpmkX8zyGKrDthgzNJb1f8QYJ7YC4gzZB6SCkQgYVGhrJ83GTrm7htdIqNmwkuRcaU"
+	logo+="vfKpoZSCADZOgRumawR9BNuSE74kzvjZHfjgOS6hCQ7/2yY64lW1qxFT+IDXKEYdL7bdVLvp4lIAwDAE"
+	logo+="OgRQD0X9AliQXtZkNDSszNRxuGLWoHSzpZ+g7yjbcy6+4iPX+6qr+Nqhp4k2iJVT34B7p60ErVDvkKWF"
+	logo+="5F3AMziNURIGPLLJ+M5UQ1rFiDjdwoP4i1ZSd7QnS3enIfD1sEsd6EdhF6jGZFoWqw43D2wshndmYw60"
+	logo+="vYsqSe1dIaHjS635JekpelbykAYqWr+nrIABm6HwGha4YyBHivIttYQFKcAtKtXcO9NMCmKzzWqNhEfv"
+	logo+="lkd7DuMQ/70rBE5xA2sGGNUjCUPb3KOC5VcTmHyzrW04W1eT08z54tjl2pJy8FBbYHXdXbawOk/ySJh4"
+	logo+="qyDNzDAlI7dERl+ZDc+F+YuvwyWF6NugBkxCdt+SKSnXI+lUAm9qBjC1CLr90qle7EmrWYRyKmq5Xc+1"
+	logo+="W4jMNzxLBze83fztlZcMLwHvvg4eORYnofhJnDagfEqrH0xXIux6oHbrfPIAjJbeSzR3LkUwCIdTogNk"
+	logo+="i806OJ1nghFbx6QWyYbNCLyVMW7zGxhcDo7sUyoh4GAs26dxndqhCT/jlbDxK2tdrRObGnY9Jn8XVde1"
+	logo+="X2X0lX9h0ag8OmA/9H4MWKHQekZqiC3Hu1MbLnZueA7PZODvsx12cEmpOuC6nQEQal6RrH+mDjK5bmn4"
+	logo+="nNNqx6gt4ST7AhxkBge7Wb9Gvs+wtdcwUEJ5vBUbxvVFcXBXB0gFonA9LP2TZaXTO0ZAIgR4ncwzduXH"
+	logo+="YNwuEMEJ+0qASS6T64XNeJ/ctJSn6O5Y6zWWlmfb57m2PqGByEM7XfwObGM0m/ghnBYGu6qbOwg2W+JH"
+	logo+="fZoq7XCn0oaar61rNwTAFEUznQQuDxun4CIKi3EoQJRD7pApAtREur8lVP2XuYc9d3tXcJstfaLXRP8W"
+	logo+="VdM3pHpOq8RCpsaD8bScC2Qthgb5F8eJ6GyGBt3zK+tsakAc70PzUOx1RAqvq/5Hr/gtqBS6YAUs5toG"
+	logo+="8Mb3QCyCjMHv6cSyuj7pfBZauOEgFi0r89Dgfrc5c3mhWNfr5FBcQIG0jJFohg2zG3Kr3Yx2eNTVi1Us"
+	logo+="y91TC9DwMUo84AQVWV97iODWwcOmsSIOjNYrrOcDF7hP345uSIE5MBiRwDpIDkxJeUJdWyfcw5AdENsg"
+	logo+="F1wsLe+XmgsK6uDA1gpnvsDH6hjO4J3FNQiltP39NAO0qK/iKayt4n6creyXA4AIS2DLmu+2y1/gAAGZ"
+	logo+="4wg1g1tTudJ48BFHoAxOoAkOPeydFXccJRkhRv62XOCcjwWKVDKftnTzG6N2OrZbn2KFh7qVLnjfs0cg"
+	logo+="bozYFIY+y9vnZq2JAgwb0Oc+9amukFIHqtXICoLYOc7aopy+C+iYDALPKyC/duRLIjQBalRL7BdSBMil"
+	logo+="lSkvgfEkBwqcPaKozhbjm6QsmVL4AlZuzlSQuUQhCcoTZVmNYgWR94S/c5VGVvHQsHISBgqMdw74UM9U"
+	logo+="8CpGZomytA3nMAyCGfrGWc5eWDiuOfXYI9zbkAYfR72C6pzGqtlOEjuDuM3WalhgJjwuzFlbfOk/B64W"
+	logo+="H5bDCq4fGpEdhixauyOwyg2D0OByEgtKU/niAeq34KICOqRge2CxajBjhGbYBEjAOyKCWCs65VcMHKS4"
+	logo+="KKEw+TAIIu1eAK3fUYSiDdLrchWtKZonz15fY2xa1KLS2XeSpdbIQBfKeytCAAI1tj7t5AMz2jk+AgBa"
+	logo+="SqL4l7BhnMnwII6vTI4YUbIlaxcEwG5Kh3cuQFXAcJKE7Ix77mnIBgDdcq3fkS1cM9iIN4bINRrGBdLn"
+	logo+="tee5cy+J124qrBhC18IMkacgO2BsV030GZe/bR5h4AoscqCBCCsHfKMvTmVEComqHpkSIL10e85QCQdz"
+	logo+="mXVoUJNwYaE0a5AGEDDsEwlyANc5StkihByUlbuUxdjD0BS3HBnkreeo/dk8KsTSwu7a5e5Gusp9GmHh"
+	logo+="0Y4u+xYIypQEC8qvuWcc4gNQN/ngqIpnqo1REgbVMAGfZJieCssBdYFG/G3uZcgOAOOUDykthwBCwCID"
+	logo+="rnoSzhXLZh5/yt7D5ib/dQZ+u9Yngco6jZhLSZSN5CMMw79LSpe4g2d1snwSECEKqm14fbBhm418ES6x"
+	logo+="Ce06QnKSyxDk8BJJsTjoK4RdjbnACQEdwfEBG2bps1ROZfL2V0PhimPtdnC/Y+m/T/wzx2Niyf0T8fat"
+	logo+="Lfg04MzAGRalkqhWdKY+p+AsB4D9TKqoSAeFXtvIwoYHE6IFZN/XvXTNggjPjVwg3h1oUTAPFOXs7ZBS"
+	logo+="qgIL4OALG6BMRkC0YUXH2E0f8XvtxAwV+CrWZW9Jyr6m4DYAsb/WrSr0GXOfwc6lEAOJktvCq6w+iKHd"
+	logo+="m0accRUOs4HNICMoKBjJwzSNWQryNAQPXjf3RTctitEwFZuDGilTOuKD8hBNs4TwQkyCkgwnKYxcwa9n"
+	logo+="wS/WyutMhmKpr1m/E+YAMbzP5DD6BHtz12YnR7lW/XUhU7XgcwPgW1smoaU1kA+ZzIhVzbd4VDQGqHXj"
+	logo+="m1/7Eh7J+TZpCU8Nu5AYnbwgMQ3gMDjOc4oTNGMIJh0r8/i2DAEPYuDLlhQ1Uq9GFoJ6lms1g6fkSXb0"
+	logo+="+iy7qy6PKu/aAARZd1HA6ZASGJ5mWltu9Mx4C8Vz3RxVsxAZD92gyty7ilgLy4YOxWKxMgJUI9VHDMCD"
+	logo+="hmV4hJGJhu9BTtYeOSGP2j2LpBzj4c7pslun6sKduxgirvfA3A2A46wkIxUcUDsgP+/ReK6d3HOYNU9q"
+	logo+="cRRwXXDH03HZCdH08AJHxwDJCFyeGc/a7982LNMgByBPc1BG3smZIWhZTpGvB4rHoYIFjwDJOx2J6Ibi"
+	logo+="4YLYecYWq9UFOyLZIu3fYUXdaZQ5dt74PXEXi1jmv5dqtUgFBMT6OXuW8p6+1iestIZhCqcuBeYkCqhz"
+	logo+="5yAMgJldF6Oi7WTwM4jtgBGcWEKZeeq5y4X/rnxZ2UEhAsgoBra75fFO7ewrHegmONhNiP5wmAsEtEnC"
+	logo+="HMuvvd0YxGvlmh8SzKuNWHKt52H1XS8RZVsq0BoNgPaqVLO09p2ZhKDIipp0dj2jGeZQgzx78Il1ijmO"
+	logo+="vBYwbpcgCIlf2Mxe9EXMLCYQNkC9eH+eXGbcR+5+OAFIoDBN2QvLPJAOqg0qT7g8uS9o8dK3gGAbGHzZ"
+	logo+="jZ8JRKw288vcrJVFlQ2nGxV1F7mKak4yGqeOvblLFjE13SsQvUatNtp7R0TGUF5CNYVt06vheBabVMbx"
+	logo+="qpDaKp6m/mc/1UzVCDI0AwJVd14zuRoRMA+b1L2yM74Vy/3Nij3IAkkQByUEiPh2DjyuvhGJ3jx5kxQA"
+	logo+="yf2sqErl7m6ZURx2eDgq0LaWO7QV3U9ixV1JYLs8N2yth+CNRKF0/UDpu6H5D/UeYdD6iSJ7hnwbahme"
+	logo+="4aXka6ZcDA59ZgwQZHgNB1Q7erbn43/HY7ICM3rI9w6TnxzYl9HrvWigaE0fdjiRpedgYMwuDSRIwYPo"
+	logo+="7HmCFAPsFYJKc9EWdaGhvVmsKWazRFLbHqopYnqcLWDVRhWwMA8TkAYaWKtp5S45i2W2caEMrUvU9j6n"
+	logo+="kMzn+Sc0jD9EbAjLKLlxersn8Q7wNPQLIdAlK781k00J+wA1LvcoBmaL18c1Z8JRYQXJvzzQXHWSPImL"
+	logo+="iD3Yi0H8ONgHypZQz/XlqxOsBjlk5M1xlUYfPNdEHrrXR+y4vqwtYSKr91iCpoPQ5QWE9pm02LxtTjAP"
+	logo+="kc9KlpFdbLtv1MY+5JhqXWKE8376i6sm8J39upqR18xxEgmrqd61U3rQ//BwJy0/owl1WufbJjbx3rey"
+	logo+="4QEIz/eZrXIIO/DSpOfBI++zi82j6fGBCdyFglttJ60oxWV4elBpXXeBOV23Qnld/yGp3fXE3lN38CP4"
+	logo+="+CWqmCidpqU88HZJgq766jy3foJy2l2OXU1gWwnHoGgPhG4D5IupDbTFcPveJwBqnZma9auD48E/SEd7"
+	logo+="LW5d6DX9aKehGAHORVRlLFVgA5O9CYaA4a+2z3ALIXOzJpLYkXux2GvJafqvO2hFK5zY8DEJlUXlMP6H"
+	logo+="FQK5XXbAUwJmiLdTYBQpV37YPXPKpi+x0AwdmONhU1pu4nwQb5XMRG4XtCG+LQ1TufdbLEqlItfDeiGg"
+	logo+="CpcwlHRtTlvtkrTgoExGHrNJeu5MJEv8DChE/Zz3UDINjQHs7xDrfNFkYjrc7a4q/ObXxSnbOlnMrd8i"
+	logo+="mo1aZNNs2bqLMMkNLthwEQi6as6wlYQt2AxREchnmU91wOv/8HgPGNmJ10TWXfl1hd0dUtP9M0cJ6z+r"
+	logo+="sAwl8cLrFqh1pxidWJdohL4zwr5nl773O+gHzMd2MsqCDhocCi+BPj+ysyAoK9Dd3S7y6j8Sen5zTE0F"
+	logo+="lbXqJytjRROY1HQK02HQNj9gKiKev8Cl7NdFnXM+qKHUtUxiHaVbCixtQVA0utSoDjpAShJofVlQMBnL"
+	logo+="OEZSDNWeVEFzPIAAIy5J0cdr2rPQefrJjP+AOiGwic2jrNhWC4RUBRwtoA/LyieKtYQEJcAcLoN0lRfs"
+	logo+="appNacTWc26KnsxvVUdsMA6ElQK/zbegqMWQvICXjt0ZR2plClnXdpjNt/SbTXwvReBMus5wCMz6SKxa"
+	logo+="Iq+/ZR5p7FnPsclf3eAMhJtvsUP0B2ASARW10ZzoszlkfZ2jvzASRxCxZmIB1PvrnRPwosWFmNcIgDZB"
+	logo+="UXIHVLGcPNckSrqnM2BwAUf6eyNneAjlBZCMRUnXWAfKMp6Whid9GLO+6mSrYvdDk7OLgvmlKYLcp2mM"
+	logo+="BAH5E0WJHpfZ9rWWVz9Fh/oLEMtAIgRwXYIN+qbno34lVXn784I7qAFyBlSbXaDPIibUHG2Evhcwbws2"
+	logo+="QEpBf7Y0gKxTqL5vTMTTFUZn0K6BcAhXWykgCyxZMA+R8oA/oCgJHkVbr9Sme2A+dypmTHDWCLrIUZY9"
+	logo+="dkD5ZUgPRkqTZ1ET2A6ar+WwEO3DzcKwCQ7xAQp7vZV6+L1sAMcogYkNLElohs8j0OgOEq//yVn7JwsI"
+	logo+="CslBQQW9Ey3V2StT4D41qTURsLQBSAHgK1juvsAeQIaBdV1J6uNrY/oS5qD1Pld4nO70egAIq/gA46dP"
+	logo+="NKAIiG6f0KllaJxCeFoeyWgf/ZAWl3vlE4+JwTQA6pXO2eL8qIWs52sSUCJLGNDxx+hQnXwmfsBkCsMg"
+	logo+="ByEvRdSUrRwFNUnVkXSGVuepfK2LQf1DoJDM8F5CTA8R91YVsJXdS2BjRJU7jtGmfrcEExXBWdl4CB/i"
+	logo+="hd1tnOuQ8iDpDjVGXv67iByGsms/Q/b4cDdDDPxU76i06XWC6XV+lRKWSAJH64xKg7h/TEfXJW3Aif8Q"
+	logo+="V+hhhAljgGpDvEbFgs+tvPqv+ZOq3uSSp9039YKCaqpwFS2PI1wLEZ9HWqqOUeeF3ksgizCEE7BAz1v9"
+	logo+="GlnTt4bRQKAYTpOQGvOV7mPt4R0V7VPZcDIEdOATLwootgxX87AeRrlxGzi9Oj93IBAgP6S39jHLErNy"
+	logo+="A75jd+ebEHxj5DPCBJY4AMh5hWPS82H1udVu9PpdVlU+l1R0GtAIjVswBp2Ufnt1TTBa0v0fnNSV55LV"
+	logo+="eq5BQwymH5FEaVbPs3XbLtU8E76fwA2Q9wvLzA0id4wxbgMIKOwWGlLIN3CIjFOuj0AN5pUUFjvdBdAH"
+	logo+="LU3xjvQ3rSiwtWXgLv3+WH75cWkI+0ZbogUU/GlE1+VFrtZhsUE5UEkM1yATIMup3KbV5HFzTd6lXQeL"
+	logo+="k79jFxKaYxbnuYLgGjvaTjsCShJtyAHAc1YfmfqUGLvB9ylv4Qe+lR66kZxHmldwCi0gkgB5wP5rTo17"
+	logo+="gA8S+Iu4d85kg4F8D4AN8/GZA4sYCkeYtomUal1dyoTq81AxxWVmcWkMN0blONOrfpGXVeU7Aqucs9re"
+	logo+="DKG39CF7cnaoo7NgAUn8gSi+UYkFGNaUcLZep+EGaqs6VyuQMcvVMA+WZSnavpgHQ5AcR54YdFadHvcw"
+	logo+="DyBuk5B6bF/dAvJ66LhYMnIIHOATkWXJ70mND7uCB506VUem0eQHFyHA73A3IEdLM6r/FZdW5D4LTgPR"
+	logo+="mjgdXFbREAxVrK2N4JOiJ7sOIkQLoG4fXPXlXdl0l9aVRV/wMTilePLa/qOcLd9zjdSXe4cZey7DzsZu"
+	logo+="sCkM7rSOOWwJbxzYmt9MuxwyENILuCSpKE7YS/03gWnVr7ApVSe2QSGG4DZMsHAMeb6uyGSFVGo5dbgA"
+	logo+="A7Ql3QukRd1P43qmhrE+hxN0fzjgIUHaDP0EzXr+SbCXt+gq3XpgJCWwafd/qexkY1VnR3HIu103Fm4q"
+	logo+="KU6FUuAPnGJzuW2KuASVbs+6QDpIOPx2yiu5ZKq75LnVqzm0qtsbI6DZA6OQA5Ruc0WgCOhzSZm69yCx"
+	logo+="DwpVMFLb7qwq3P0IVttVRR2/czEM17HMCopcq6HjzD1H2hOy6bqup7a0r7AxYQdY3zHBG2hbTDsj/sDF"
+	logo+="Lh8E03p0a97gwQ37y41cR7HTkxceNRwBIAsqQkoVZIVXE6ufZXAETTOBjyA3KMztrMUDkNd2CgouwjA9"
+	logo+="bXmE6rLmx7AoBgqMLWb2cimldTtv1LuqwrFwBZjamyKjcKG29V1T/iAJBvXVVY1FQPRjoFpGYow/EMkh"
+	logo+="q13SEg2SsKifc6spZf45sd+834zDMJkNhJgPgTABJYkpjB24WLYeWplr9SKdXHpsEhPSDDLBTZm3+rSt"
+	logo+="4k++Cg81uvAwgeVhe0lFIFzftnKJp3BHQr6HNUaediV4awvEtIMMwtfTscNNBBQFx2rtVYhh5xBghVM/"
+	logo+="SvaW+4ITviTO/UqGEHgHyFniiS88UQFQCkzw6VaEACixNe5/1E2Vi9mEqp2QlwWFmVC5Cs+k/VmZufPS"
+	logo+="OtTtZlxBkFrRdS+S13U/nN+bgXMoPRvHvo0o4MgMLgMPlpBkRT2fc4XeWwwxQa6C4zZWEGecfpDFI39O"
+	logo+="dpb1iYGrWM7Wo7BRCf7Bgd+ewRs3bCrCMKEJg93uKXpgu2xsaqxwCK4+NwSA/ISdBNdMZmHd8CAXzsCH"
+	logo+="V+YxCd17SWymvuAjBGZyjc/XuqpGMTXbztacrY4S00gFEuWVAxcAld2XfICSDDZ9X2uXyo09VDW10AMr"
+	logo+="0Er3dKxDMOAKkih2OFP/z9iBSABBUlbOQFR7rlHHqjxUKlWKyT4JAOkCPwf28tSK+9RJYvO2vzRVRu84"
+	logo+="MAhYXKa/p+hsLdRwCObfD6kldxu5ZXePsMCMBhsuWjO+gPUtW/iXNpVj142BkgbF2saQb6xsi0KYAcR3"
+	logo+="uC5GRxeeaTGfMhO+NMAcSXDyAsJAlZfOBQJ1cHqTdadlMbHcAhFpDMTd/RGZv+qUqpP0/yLziz4Tp1zp"
+	logo+="Y/U7lbOkFHp4eZyACIcRoguzQl7al0SbveU5ZNRPeO6U04VbDBASDV/fe7DkcZ+jUAYnUGiMPqjItSIp"
+	logo+="smAZK5/AXiUJKM5W8CIFbHgKzgAUhC03U88sPpFIsBwDjGwiEtIN/QGXXPY+CipB6XnM030zmNr1I5Wz"
+	logo+="50GGoiPyCHaWN7Fbw+Rhe2X6uajVIzdDaAsdsFIMdVjOswfjDC73YBiL027/Ql1ucTAPncO5ksjMMvO+"
+	logo+="Zan8zlJ0QBYgt+/IjPPod6Y+XTAMXoOBzSADJCZdStxyWbZF9ofv156qyGJ6icxn7OWCzpARmljG3ddF"
+	logo+="H7WrWxbanKYtGoZrnQlb25k0v+9E21P8o4P6NmMMspIDU7P3Bg4Kp+4J0SOTIGiE9a1L08Zo86AMQqCJ"
+	logo+="BTAYsHffOSfkHq2gNjfD2odRIcYgFJq2uF5dT1knyL6ywaOqtxFZ2N7t+GYeJgRQkAoQtb9wIc2fB6my"
+	logo+="q/4zzVHJJJSyvngMRzfo5l8DMXM0iZYxdvSqTVDsj72jVkNWd9MqLj0ZhfzBeQqRG9hYSbkOipSq5Mo5"
+	logo+="IRDskAOQRwPKSSIPsQQFhEZTa8DVAcEBTNKwyQk6Ct6qK2p6jClhs9zdskmVi6z6GY3i9cAaKpGviKy7"
+	logo+="nAdpZCOJwDMt20wBisMUC8U6PjSc6X3fMAw1w8IHHvEj9Bkqv+ycIhGSA1LV6pVeIC5/JafkplbX4EtF"
+	logo+="d0uDs5IEfUhS1mAONeVXbbuap5IDTTU2yrauIcEKqqn3PfbNz+cAZI3Xu3THvTTRnan9gAiewh9SABGI"
+	logo+="+xcDgEJMYxILnTABkk7bun3gA2xxgc4gEZVqfX/FVMGiqV1nAjAJENelSyfBDXgHwFQGTQ+c3xcmUNev"
+	logo+="DSynCq7I9TQEY11X2cpYjG7Q9ngFS/f8O0N2FtKgBkFIMVSU74une0Z4Ehv48YkByHgJzwz11JtOanNj"
+	logo+="B3AxSjEgGyH+AIE/plqdM3L6Uz6muozPpRyROmpgNyCDT79MLWaNk2Jj1c2LpaTN9+LkAoS38jEWxj9o"
+	logo+="djQL53ep+9U6I2k67DvTOinx7bTHQJSLZzQPwKVq4lg6NqEbWh8tgkOIQDMuCVXi8oVZVKr/UFKNplzS"
+	logo+="i0gXFcnd9konObMKRjgWo+C7Z1YHqbJxeOczKDVPZx2rGamqGrx+FwAAj83nkDnkVpUUSV8tjZJj36E6"
+	logo+="GA2CN6P0PHAOfBMsp/AnB8AmqVAJAmQcGEOTUXUBl1mVTGplGZU26b4fV3s2nDTn6Xbs+L0ysrTgcEc0"
+	logo+="FIdv411YN/dAUI2CeviT7pxSlRiYvST4WjnAJk+SlAslwD4pe/MpboqY0eK4RDJCDq1JoKsDf4PY3RY5"
+	logo+="a+6WEA45CMKbeH4TUZZovrFRymDGZTTzgY5idJAIEZ5B9En1kz0OQKELp6SCf6xBelRZucApLJDQjMHp"
+	logo+="uJ1vrrKyMBjFGxgAAcJt4prXmVP1Vn1JtlTLn9SJ2z5Qn0gCkoTJczSrsuoMw9+xzX5p0GyCgunUjcxA"
+	logo+="DAiCtAFjAfXCTqxDHHHAA5Og2QDD6ArOTuF4INZDZUvjcOh2BALHW4acfnGr0yqi+n0ut2ToNDAkDUOY"
+	logo+="2fs8uoeWpwE28EMz0NzotXTwHE0ldDtBqxDP5uEhzTAXlf/OyRGrUad9q5AHEa0ZsT+18SNzIA8cgkOI"
+	logo+="QBskOVXcur5RumxqrT63azYSfSAjJM5za+MO+NbjKX7vOuq7tPAmSUYnqJyk9R1YMNrgDBdmyiT947LX"
+	logo+="LjJEDS+QHimxv7d86DYJjGhso9IgH5km9oOhtynl73yXjAonSAfIhNc5ShTwCHuVc/3p+QBBCmr4Tou7"
+	logo+="X0XQxAnHQ5g1QPJIqfQdKi3mcBGYv4nTCLEAGSH3cDJ+nrmd9Ng4M3IJY7eF0YLunS69omRfRKAUhOQ5"
+	logo+="NbctPngFCm7kUAxRGX1d0nt18bJtkYZFcGloH/Nw2OyYCMCG3jNi7+qZFnwxJrVAQge4mWV+uZbpGAdP"
+	logo+="GNR6LTal+Zlg8iFpCchi7sUa4MfQKj3NR9IW3u3s3Z/mBS+7XeZFJvJG0Z2OkKEJf7H+TLq6igRfZoX0"
+	logo+="d2CAEgRZwHWV92LgAyKgYQeqPlNl5wbKy5jkqrOyExIIfdVupn1hvlWxfQpu7tRP1BTgHyPWlJIbYcKd"
+	logo+="bIcgVI9dATUhjoD4gBBOyPZzgH6/rK1QCIVQQgR1XJzBk8Z49ahxmFogDZ/Joy8gmf7qaeIuIGOmOAMP"
+	logo+="2vEH+/lsE8LkC86vuvlGIGeUXUDJK/IpYAkBfFAWKp47Xuzai7yWnKrQhA6Kz6G5TRTzB4K3a8xKvDlA"
+	logo+="2Qz1TGIaKlK3a4BTiOuQZkZ58kFwNQpNsAiRI2g5AY6O8yhSIB4fXkBjiSZQDkmEqqzlZz2mPV/TTvFm"
+	logo+="wAiKayJ4bH7HGqkY7zGeSv0gCSGmUWA8gSYzRnGivA0SwKkI3Vf+AJyHYZAPlWGf4cXqWKHQ9NgoMckA"
+	logo+="LigzBdZ2gsA19xADIKf3OVVIDUCwUEK5uQ5LhT683bRc4gd/AEZJccSyzFtevKndt1J7Y/EADIAVwyER"
+	logo+="/HMvD7CV2mHAICxnmrZBfmnRrVKByQFVaMAiaYQfpEAZJafSevLyu99jM5ADk9q3GFgoIjm6N7FdgdI9"
+	logo+="O6SxEAQjG9d5N7xoZogOJTLkCo6qEHJLu4RamRTWIAIckchBmkySEgycQzyOM8Z5CtcgBCZTcaFRymLK"
+	logo+="tMXTEAx/FTHabIAQE46vnsbVFVAw9OgsMxIMewhJCUM0iVGEB8shI4a0yp3zWXigOkeh1PQN6SB5CGES"
+	logo+="WEfcLMUd4VD2Acm9yCjRiQgwuYrkuJD2b5UENb+ndxAzKULelF3pwaVeAKEK7CDb65K3/NeSPfrXxVFC"
+	logo+="Abqxv4XJM6rS5CJkCsdHZDjYIGPITKt/+Wrugant6jkBAQPv3RVfaC1pN6FDoGhLLs9JP0QgGMt/kBMj"
+	logo+="kv3T8nLorbzVt5p8gZ5HtsfUB8UWvWnAaAfCwHIPYo3rvm9bKqvOsRgOOk4yae3IBomJ53eR0Qqy5W9R"
+	logo+="/gBmSoS/KLBRvkKVGA5MZy2gf02+brRAJiVadWL+O3zKq7Sz5AGr7R5DX9Yt6RgY19yrtec93llhOQbb"
+	logo+="hc4vVdVg28Ob3L7XRAsPSP5Nd8c1qkXgwgfrmxGZwHAUNMvZ75XAwgoMm8Loxt0VZXLxMgOIu8P6/cvh"
+	logo+="mNXnRZVzF3G2jngFDmni/49kqnmf5fYV1eAkD2qho/kb5HpHfG8uu9hQAytlmYHfse0VPg3cpUUYBsrP"
+	logo+="4Wiz3wuTZb59u6b2QCBHWrKtfyozlvb5Tu8KPLtw+Q9Ul3AgjTc0Jt7g7h+5DTVPU3TW/i6QCQmsGnZL"
+	logo+="l4LEcKgBwlBsTBbvrigpWcSUzqDcwykTOIVb2x+lnenpb0TSvZ4tXyAGKlcgESiavFe4yYWn8Ixvg6gO"
+	logo+="MkYZ90Z4CMwuzB226jqvruc9TEcxogNYNfw7JNvgcVALLNNSBclU1WPEhkOG+o2iUGEMwo5Jtua9s43P"
+	logo+="R72QCxFWz4kM5v/NWcAQOjccu3J4F+dqoFtAhATD1r+J7CmVVD5wMUB4kAqR58Qdb7AYC8ygmIq8INOb"
+	logo+="FbiNyvWGZUHCBWdUrNn4Vcozqt7jkZAUH9jsptume2s6Gu6AygSzvbpvdIFwaIxtydyrvwNgJa1Wdx0s"
+	logo+="RzKiCHVMwHP5f1ptycGhnlFBCyyiYnF+fFcMfe2wrGfSsGEMwNwTbQwiCp/RNbKG4SIPVSAcLWxKJzt1"
+	logo+="TT2U2zrokNbez4NYBR4qRHujBAzN2FQuoka5j+h5018ZwGSM3gc7LfHKyGCIAcEVO4AV6JOtfSG5gXRA"
+	logo+="KCulVogWoqo+5BAGNELkDsFRVPgL41G6opqou3LaFLt5kBjtGJPdJFA2LuNvOuW4bjw9L9a7qy7wghIH"
+	logo+="tVjUPuSX8GOEpEAZIb+y1J2IlqneVH1PrKL0UCgkstwU8OTUZtLMBxWEZAxvQAndf80oLcxos9igoM2y"
+	logo+="jp1NMl29qn9EmXBpCKHeV89zpsToH3fwhw7HTWo3AqIBjZ67Z7BlAYxFQ2sZX/ifsn0VM8ufJ+sYBQqT"
+	logo+="WjdGrNrYJdl2l1i+iMTXtlBmSsePWwOn9LsTq/OWQmG+FQxq0+mtKOdwCMAxP6pEsMSE+OoAJ6aHdU9p"
+	logo+="W6auI5CZCqgfdUXfxnKMGCUbkAxUExgPjlxR31z4njLheJHq31lW0iAUE9pk63hAi9Zq/s2iuo9Pqdbg"
+	logo+="BkXNV5zf+j8pr/rc5vWip7JUZY4niVdoTSxe3/oEs6dtr7pFvH4ZAYEKqiax3utguygap6n3HZgm0KIF"
+	logo+="41/WFuf8J4p0e/KbCyycROU5tIygDR71ReC4B8L0F192/UqXWBgi86r+WndGa9xV2AsM1zTjXQ2U8VNB"
+	logo+="upvJbHQL1FA2NsPAttCo2x4zGAogz0EF0MQIypfICMaExdjwl2EFT26ACKk9yAjHmuBopmZAq+OSXmWg"
+	logo+="BkVCQgVr/82EeIpvyNVXdJ1B/ksJjmOTij0ZmbX7A1z+EBSI5oQKa2YPuOym9togpa34V//0Fd1Brqld"
+	logo+="dy5UTVFLZdpS7YGkAXtSVRRW2PYqdbqnhrPiyf3gM9iX3SadTiMZUdkO80FTtihd56NdMbRFf2HuVs4n"
+	logo+="kKkO/4hqtIa6ynLy8VC4h/ftyxwIK4RYSQZEnTYar26OnptaIy/jSZDXEAyMEZBMRFG+ipPdIn9UmfoG"
+	logo+="4FZIhmugRvkNIV3b9mu0xVuu5ROBEQTVX/E6qZFADiJgBkVCQgqHsC8hK5G2lm154JYOyUABDsUXiCTq"
+	logo+="u9Tcz1n5FWdyHMJhYFEE5AclW1fWcKX1btuJZievc5KD3qFBCNZaBVTP9J6WaRjOgSPoUbnPZLL1g5GG"
+	logo+="iK+yHnzUpBe6TqgASAoI7SaTUviSrRg5HAWZvvA/1WAWQaIF/T5TtuF7UpiRG6TO9eJ7V5nQFymKhfiD"
+	logo+="vEJyXiCgDkKGnarQtArAEF8RUkRrt6Y2UAAPL99GxC3oCwqk6trVC9I66GLlsZPrshFwAZVQBhAaldUN"
+	logo+="ohav1PMd03ToKDEBCNpf9hj9pLWpwe9bI0gKy0BubH/R/JMU/fWLUCgBiWAhBW0+v6hTb3nARvzuYAAG"
+	logo+="T7PAZkNyypbhW7h+Nl7ltKMz3fTm99wAlI7UzuHzmUq9dFaxZnxAxKAQjoycDC+Ggyo736LoBiVCJAUL"
+	logo+="8Va5eMe7qyN+uo7M398wiQ43RZ16sY9i461svUvZo29xxz3BvEBSCW/t1n1fad65FxOj5ZK/wBkBHBgO"
+	logo+="SPA2INKIw/EJSXRPQ0p1Kq7gYwRiQCZCzMPVeS5Cbc8c1uSAQgeuYwIMOa0u2pXqXdl4m+X2BU0+bute"
+	logo+="MNdPgBMqyu6g/26GC2xZkxf13MF5A8h4Cg9kaQtIlmDXfLKoDjuGSAsJDUfaxO2xQkWaBfzpYlVE5DPo"
+	logo+="BxXBZACt0OyFEEQ1PSIU2+PdP1c8rcXe+y7KgrQCx9f1Z5vMDSAgCp48hLn9jt1hUg1gBjfH20JZookE"
+	logo+="29sToSADksGSC2meQkgLIBO95Kdo/y689TZzc8BYD0zE5AOneDPqcydp8j1S3xYrqXwbJq17SiDaSAWP"
+	logo+="rLhIatzMTeyPkAyF4pAAksAjXGG0lKltqWWxY/0H0SAsIqBirS6XW3SH2vMLNQndf0N4CjF3TUgwE5DH"
+	logo+="Dkaso6oyTdWzBuXUCZdrwJcIw6rGpCBkiXmD2WGbNHAI5jDgHJ4QkIanFCJon7l3W3YvGFjdW9UgIyAZ"
+	logo+="RaOrv2N7LctIzG86mcpjsAjFx1ftPnMwzIMF3asQ2gWMtCkS39AFSbuoMBivdclv3hBuRz0i5THghJzJ"
+	logo+="0OK5tMjuh1AsjKyYAYE6xBxQlvER/8ncaz1KnVJqkBsYe7j1BZ9Wm47yHn/cPPp3NbEuj85n+A1lAFzR"
+	logo+="8DICdlAOR7AKIHAMnUlLQ/igGMUniinMlZZX3n0uXdmUTV3V0D8h3F9N2sms0CgKzzzZIIEJs+Q3xwdL"
+	logo+="VurH5VBkDG9Hs6o/4lVfKmH7vthlosGqz3q8lviQVY7lMXtD4H4PwbAClUF7UUAxybQBsAju3sz0U2VR"
+	logo+="e1lgEkKXTR1pfVxvYnKGPbb9XFWwNUxs7z3XbuyV0U2xOkYsdB4sJxzgE56mXpW6qa9QKDFAAplQyQYt"
+	logo+="Sktbx2Y1Mt9wAUx2UAZCzc/RCVXf+WKqf5ApUiDsaA9TTa1KUDKD7kXVnRMSAjdFVf0py5P5hc5ZO9ok"
+	logo+="06QBKtQSVJb/OJn6LSa30BjI9lAmQsSPEw/PyG3EuvWSO4p1GxfRVd1tU3LZtQOCAnAY5b5ty98s6P/T"
+	logo+="nYIkOuAYnjAUiidUlJQo538v3kaZSwFKJSaopYQNJkAWRMj1NZDXkYcjI/wRg6S1PW9Shd3vXR5HB30Y"
+	logo+="AMU+be387Z+xaQnXAuzCLvCQUkcBogoKWrKkma8kxectXcB0B8LyMgE6J5N3dT2Y33ojtzrnNBl+y4gS"
+	logo+="rrepMu337QcT6IKECOgSbM+YeLd3bspQDIp9IBkmQNKktqXlaWwKucJ52y6VqAok9+QMaDFb+G143q7M"
+	logo+="YgjwukE+WRajtXU7b9Ibpsexd3wpRgQA5rmN6IeTMDBwEkvrmx70sDiA0S0F0hpYmLee47eNm7S510Ay"
+	logo+="ATY7A+onMa19CZDdfNxu/Pq3T7lZqSbU9oyjqb6bLOEfKMQv6AaJieL9WVPfNvqepvjDwbAGkXDUjJOC"
+	logo+="DW4LKko0vKdXfxPRfWgE+r7XUfIJOCFfeBFlF5W35PZzf+xiMy4KbImaaO8+jijtWa0s5kunTbB+OBir"
+	logo+="xTbnkDMuhl7rti3jo5tEbdWX55sXUOQ96FAQK6yhpcnpTMy3hnXZGNarbUaHrd924GZGos1mEqr7mFym"
+	logo+="96g8prugP+b7Eqt8NtLRPONHaerzF2hNPF7U/TpR1GumTbf51G8soKSG+1ytj1Y9V8F22G1gsAqeANSL"
+	logo+="ErQFZZl5SvagwoS+CdF+CVUnsFnV5nmUFAHMZi0fnNe6j85i3wczad3/IK/PwIXdi8EovLUQVNC7GCCZ"
+	logo+="YkYnWqjYP/l99xnldpy5W0cev16uKtywCA26jirY/D61rQItBuzrI/7gFkBOyOl2WvATarIGnUqv3yY9"
+	logo+="OJADGSAYIaUqHbqy1bJahyCZ1eawBAPhMMSLY7U25bBYaatPOL5pUfkA/UTLe/QoQzN3Be3P0AyAmHgB"
+	logo+="QlTNsLIQDEpia9MajyVv7h6ussGiqj7jEA4wsFEFkBGaZM3f9SMV1nKBRwSGDByiWge6UFRGfVVhg+XW"
+	logo+="rWCYvdya49U51R9zQA8rUCiLSAUObuRvid0kuejwQXrLwEZpFtLCCFzgEJ4gMIqlk/GmLWvxXLxAp7Um"
+	logo+="XV/4zOqP8nQHFEAUQsIF0fYHyWMtoFCmYRBhStfEtiQMb081DGcAdpfsk0yam5gM7a/IqtqqICCC9ATD"
+	logo+="s+okxdd3qiO3t22iUF8XcBIN9KDIhNGX1DcIVO+PRubDwLAHkUAPlQGkCa5jIg3VRF9x1CmuQowiFLSh"
+	logo+="MvCDDGM5IDAgpLrpOhZkP2EotOeH419nXPqg9TZ20uBjhOKICMA3KCLusqU5d1hiijWG6B5RDMIg8CIN"
+	logo+="8JASTECSATdL/WbHhcsH0yJvn151GZDY8CFB3zGJAeTfn2xzFzUBm47t4zKYi/PLA4YTMZIKv4ADKmX2"
+	logo+="pN+jXRlttE715rMjdfpc5u+D8qq6Gdyt5ycg4DMgpQbAc4/kKXdF6njNKZljVrTgNA/gCAHJABkFOgmP"
+	logo+="VPYziMJOeMM0t2470ARgGd07hXNCAFMw7IXrpsWz5Vuu2+BRWdlyiD0gPF36g7O7gk6S2A44QMgIwvvU"
+	logo+="LNur9qq3SS5m5j62cqp+kBACMNQOmD12EPBmQYtEdTum0DVdJxD7aAVkbfLJKgsoRrgkuTjEvkAWRMR7"
+	logo+="RmHaOt0IcJdg+79IhtXYCBiXRu8+10btOLAIURAOlU5zXvhp+H3QPI1j0AxlaAohD073Rpu4Eq23ajoA"
+	logo+="60inggKKVJYQBIv1NATHqxkNg8Xyb9B7j84pukJXxJaT0NC0LQhY2/Uec2B56e17qczm+5BaB4UF3Q8j"
+	logo+="Rd0LYWfl4PQCQ71aLWt+nCthfVRW1PAiQwC2xNUBd1hFLGtpu8Stsuw2opygiaD0Z8o1YNkNwWUrZqUC"
+	logo+="5AJuhhLaMvCDUZEvmm/SqiyIy7hUMqkmKDK3Qdp/ZCJAdkoh7BJRju0Etm2CuiiDsEllsRAEiTzIBMnl"
+	logo+="lM+mKt2fBAMJP0C+UbUGRWSGjFat8QRp/GDmCz22BB3QV2SxZAc2dwxWrFJaqIZwtuAuLTHQZul5tBGd"
+	logo+="NPQMvBfvkbaHywWecReddLGd1FIWZDNLv/Y9LnahnDfcpomeeylDHcDINhPQyKgzMEy1jg5DchZn0T/L"
+	logo+="wBbJm/sLYMs1qrNemuJu2PQuLAQAhwJkUwAYZHAII34bibbaE24/FpxzE+bVmV4RplhCjCChZ5wD0OGB"
+	logo+="zvADD/m1FYHOveELOuD147YXBvgldzKKM3wiBPDjXr18H/vYY/21RfZPudvsr2t7rt8LoHAzNd2k3oZD"
+	logo+="Dp7xGUfanIPLNXzLdchzFZM7gMk10Bpo8wgQwfDFLNUorMQwljdJcCLLfbn85DmJk4S6H4Eq4hD50FUo"
+	logo+="fOKKLIuGDuSAijS4AB9wZo64zbL05dzbrmEJPhX1qTYfXScsNVyjenyIxJuGn1hbhUgbX/ozjTwABtAd"
+	logo+="0n92wDM9oXWkbXwe7oM/qXQxjD3ZglSdrTURFFZlTQc4TwhFbqvENNuhg0gmEwP4uG9VSjeqJhHcLoTb"
+	logo+="gcssO2Fj1bMCM8Bq/3wu9i0UaKqP3tmcodVkQRRRRRRBFFFFFEEUUUUUQRRRRRRBFFFFFEEUUUUUQRRR"
+	logo+="RRRBFFFFFEEUUUUUQRRRRRRBFFFFFEEUUUUUQRRRRRRBFFFFFEEUUUUUQRRRRRRBFFFFFEEUUUUUQRRR"
+	logo+="RRRBFFFFFEEUUUUUQRRRRRRBFFFFFEEUUUUUQRRRRRRBFFRMtpl1566U8vv/zy8/EV/63cEkXmrSAEoL"
+	logo+="+77LLLCkA/AD0Oap2ie+BvagGav8PPN/P5fPj7zaAHBepu0HbQfDi+7uKLL17A59jw99cTHKNKGQWKOB"
+	logo+="q4F8CAT4bXow6A4NIhGLB3wMeouY4Dx+gU8PnO9AB83gOksxr87U1cnwl/06yMBkUmyukwKJ6BwfGd2A"
+	logo+="GLg/+SSy75jRsBGTtu3XnnnXemAogikspVV111LgyKTRIP2MMwm6xwJyB2beWCRAFEET5wXAID4iOZBu"
+	logo+="swDLQoNwNiBTAL4RA/UABRRJRcccUV58Fg+o9cA9Wu38By6yp3AmIf4A8qgCgiRn6AnhqZ4Rh7ote6Gx"
+	logo+="DQL3/5y1/+UAFEEUECA+D3AgYduld7QD/F5RPhe761e7Z4AwLv22Vf/k3Uz0BHxcwiCiCKuJRzzjnnLH"
+	logo+="zCEg7wvTBQH0VDfqrXC34XjZ4jF+9tA71CqA0CS8BfuhjgewnOvdKTAfE2hl3qUxz+gK8xosTXGL7Nzx"
+	logo+="j+ma8x7BD8vAf+rw9eLb7FEf/nXxK2UGV1blMRy5o1py0uXLbYtyj8OfjsWtB+OM5eeP0O9AvQnaDFfk"
+	logo+="XhT/uXRPxK1LHgfPG88fzZ67Bdz2779e3C68Vj4fUHlC69zKMAgQH/NCEcLRdeeOHPCT7v0SlP9WH4v7"
+	logo+="+qXOyHiAHE/v67Cc7/a08ExKckfJF9gFrJNex9P2OEAQc53+PpjLrTfYrD7oDP+YjfMSO2+hSFRfIFw6"
+	logo+="8oTI/ny+9Y4XX+xkgfT7E9PiQYXB9feeWVP+YB3Xr7+/4Lg8uPYIknChAw/C8kgdzRLvtMAXKdUUfDwE"
+	logo+="mGwTDKc/BM1A7f0uiLSY+5uDTsSnhPr4jjWX2Lw3MCTXE/5DpWYEH4hfD37SKONepbHJYWbYnWzKTt4U"
+	logo+="u4fo/nOSthnNabzgxjqQHB2YnEFkFPnScAclO59icAR4OogXpK9+AsxDlTFUcugb/dL8UxYfnXCU/4s5"
+	logo+="2CaAy/Cf7ucymO5WMMb/PO1/58pgB5hmT2UMkcjCgWEADyShLQYYl4xowDAssi2zpcEjjG9AtXM4lvSf"
+	logo+="gv4G++lviYjdpG7bRls2/+svOkgmOCtnone1NuBwS+/DKCwfGWG0AVBQj8/lkSr5sn2CB2Q9UqvUZsdW"
+	logo+="STaDO0XvD7ITmO6VMU/uepNgfMjM2yHKs4fO1MALKDYGAleAIgoIkwU3hPVLA9FsF7H4ffHSMY5MaZBg"
+	logo+="SXCvBlHyYYEBY0wv2LIwLQyIVlhplwwN4y9Zh+xWGPyANk+Ek0ptHon3CsRJmOhXocPX3uBuRjrsEBg3"
+	logo+="CxhwAidoNSP9OAgIH7POdAKIp4w+F7jWH/JBhEOye6gNHAtbmJyZZMoI+BYXw3vL7peEnGumWLfYoi7l"
+	logo+="xijD5n+jmG9xB64Xb4GCP+BLbMXfDvv9tc2gS2T3H4encD8l+RxvFsAeQTb2/Ha1i3AsLtWt3vzGtj83"
+	logo+="qx+xMuBxEayBOAjCDzTIU9Ps3QLoi4BH73IejHAMQ6WMKF4zk4u7ZFxqhfEh0LHwBT9nG8mdgz4Hc1BO"
+	logo+="/fP3HGcgcgrQSDw2+2AwKfv9LFsd0CCDwxryB4spYH5cX81JnCk9bI+ZQtCn96wpLndQLbpcLpkhAGLu"
+	logo+="n1+RVFPEowwHudDXD0isHvv+G8vpIIX3cCUkowwO6d5YD8m+PYbgIk7FYZ1+cTXbDGCTNWE/cTPXy5FN"
+	logo+="8hLH8yuV22YQ9zODA2cl9f2O/dCchzBAMsbxYDspHLRe02QIoi/ugOQBCKCXYL5w52QFnEuRItHy3cgC"
+	logo+="zzdz0Lhf2Oe4aMWOM2QNALRDDIjl500UU/E7JLP5OAgFFeQXIO7gIEnrAvuWkGGZgwaDltFql2qtldfa"
+	logo+="5zKwy71vVnRKzi9tRFrHOnnX4aDIAvCAbcuzxnBD+7CzlgBmeQvVdfffWPPAUQe1CgO2aQlgmD9gOuv3"
+	logo+="fkjRIICLeRXRjmx/EQuY8g1OV5t3qy4En7CsFgG8WKISSfh4MS/n7nhPdlOIj+5Q0I/E0RFpCwF5FoJD"
+	logo+="TO13oMIMaI+90ESOmEQdvC9ff+xmVRErmwcwjsnYdc3yM2Nk3UZ0gu9hz07wkG3AnQh12t6e0hH12OIm"
+	logo+="nhd4/An5wuxU46Bk7C/+0jOOdjjjIYZwIQf2N4CMk+BoDkLUb9CqIuPzVrRbxB4jlzds58ll9gPP+F4P"
+	logo+="p6xHqxuOwYuYz113ksXbpxsMOA9YGBeim83gj/l4Q71QQ72r3w3iApQk3sdbpIzrdMLkDsG10fONaIVy"
+	logo+="a5TJO9KYIBcByjYJ2dKw4uXKrhU9/f6L+AG8plUUR2S1HEo9Pfu/Qi23WgoY+blGFBrvYgbICSbPaFvS"
+	logo+="5iH+Rrt+6DjAlG3RKGvUuhJy+++OKrxQKisiVpdRMeM1QmQJ5wseubOd0OicgiCTNx9ORmASsOf3vC3x"
+	logo+="1hQ1Jw/6Ek/BfOZgBbYhLR0mwzumEBwNt9iyNehX8fcPA3X+F1YUjJDdkRZ06NwyLdEQftgmt5EkNjfI"
+	logo+="rD/gb//pQwlCZFNVOCISVOKiZKraVSzCD294UQHrPXxfLObYD4FC67Bn43TDAYPsYBhLvXmKTkWxT2/w"
+	logo+="gCDj9kk6iEbeAJ0aNo70yKxSJw04rQ4YDCpVepZlJgMDwkczzULqznKxUg9nMuJjz2/TMNiN2YfVueAR"
+	logo+="R2yFHIOy7F0PUri0t5yp4Ehr/D/w/Kcn1OYtRmApI/kRZC4Kl70F6Rwkifcr5XEJZG/cJRVqS7AbHZIp"
+	logo+="KHhI9i1K9T+8CWD/KNpOHnxvA2R7FZ9qzFryS+vg5XcWBuFxgQt2A1RAnhaL/ooosuFuPm5cgHeYnwPF"
+	logo+="6baUDYQWTUns+uwyUKO4e1+YOcO/kSZhTiubvK8rN77L6W7FilkReoPE3QkIbB0SB2s84ey8UV7iEKEH"
+	logo+="tllt0E53McrusXMw3I2NIH/i5bZJLUXj6xVP7GyKvtFUVEJEmF5frmRv/IHceCayvgEzA5U7NJFAySav"
+	logo+="Q+kXqpcMbASiNXX321hvAYYnPS8TPuJNw8NHsCIOMDqTgiAD1IPAfP1z7GiBdd5YW7chWje5qHx2k8Y9"
+	logo+="GvOCKaz7HQi4azG+t04Jlii25l1WwSe2nSO2DArAO1wM/bcFMQXptgAJlA/wE/3+7ICCewex7GXW9XCr"
+	logo+="BxhURg2MxzXJ+DCrPI2RO8dxcSvOdBZ0sJ9Os7Ut/iiNV87gF6aOA9f0DPkL3yCLpnT4zVjoI1/xaMQw"
+	logo+="LDOFaS+Kk1a07D0HHforAX7IAO2ZdgmCl40FZaKLwM02q5Yqi4hDXeiyJD7Qljjfa9ogN2j94e2/VGVG"
+	logo+="D2I848cozf/w85LGo+SsZG8wAAAABJRU5ErkJggg=="
+	
+	count=0
+	
+	while IFS="" read -r line || [[ -n $line ]]; do
+		if [[ $line =~ ^"#" ]]; then
+			count=$((count + 1))
+			
+			if ((count > 1)); then
+				break
+			fi
+			
+			continue
+		fi
+		
+		raw_specs+=$line$N
+	done < "${LOC[report]}/report.txt"
+	
+	title="CARI daemon resource usage and power consumption"
+	step_text=$(grep -oP "^  - Step duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
+	
+	if [[ $step_text == 1 ]]; then
+		step_text+="&nbsp;second"
+	else
+		step_text+="&nbsp;seconds"
+	fi
+	
+	total_duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
+	report_date=$(LC_TIME=en date -r "${LOC[tmp]}/report-results.txt" +"%B %-d, %Y")
+	
+	cat <<-HEREDOC
+	<!DOCTYPE html>
+	<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>$title</title>
+		<style>
+			@page {
+				size: A4;
+				margin: 1.25cm 1.5cm 1.5cm 1.5cm;
+				
+				@bottom-right {
+					content: counter(page);
+					font-family: "Latin Modern Roman";
+					font-size: 0.9em;
+				}
+			}
+			
+			@page:first {
+				@bottom-right {
+					content: "";
+				}
+			}
+			
+			span.footnote {
+				float: footnote;
+				font-size: 0.9em;
+			}
+			
+			body {
+				font-family: "Latin Modern Roman";
+				font-size: 0.95em;
+				margin: 0;
+				text-align: justify;
+			}
+			
+			h1, h2, h3, h4, h5, h6 {
+				margin-top: 30px;
+				margin-bottom: 15px;
+				line-height: 1.25em;
+				page-break-after: avoid;
+			}
+			
+			h1 {
+				font-size: 1.9em;
+				text-align: center;
+				max-width: 75%;
+				margin-top: -10px;
+				margin-left: auto;
+				margin-right: auto;
+			}
+			
+			h2 {
+				border-bottom: 1px solid #cccccc;
+			}
+			
+			h4 {
+				font-style: italic;
+			}
+			
+			blockquote {
+				quotes: '“' '”';
+				margin-left: auto;
+				margin-right: auto;
+				max-width: 80%;
+				position: relative;
+			}
+			
+			blockquote::before,
+			blockquote::after {
+				font-size: 5em;
+				line-height: 1em;
+				color: #545454;
+			}
+			
+			blockquote::before {
+				content: open-quote;
+				vertical-align: top;
+				position: absolute;
+				top: -20px;
+				left: -8%;
+			}
+			
+			blockquote::after {
+				content: close-quote;
+				vertical-align: bottom;
+				position: absolute;
+				right: -8%;
+				bottom: -40px;
+			}
+			
+			blockquote, pre, .box {
+				margin-top: 30px;
+				margin-bottom: 30px;
+			}
+			
+			code, pre {
+				font-family: "Latin Modern Mono";
+				font-size: 0.95em;
+			}
+			
+			pre, .box {
+				padding: 15px;
+				border: 1px solid #e8e8e8;
+				border-radius: 4px;
+				background-color: #f7f7f7;
+			}
+			
+			img {
+				max-width: 100%;
+				max-height: 100%;
+			}
+			
+			img.report {
+				display: block;
+				max-width: 105%;
+				max-height: 105%;
+				width: 105%;
+				margin-left: -2.5%;
+				padding-top: 35%;
+			}
+			
+			img.report.first {
+				padding-top: 50px;
+			}
+			
+			img.report.last {
+				padding-top: 30%;
+				padding-bottom: 50px;
+			}
+			
+			img.report.vertical {
+				width: auto;
+				height: 105%;
+				margin-top: -2.5%;
+				padding-top: 0;
+			}
+			
+			ul {
+				page-break-inside: avoid;
+			}
+			
+			.about {
+				font-size: 0.9em;
+				display: flex;
+			}
+			
+			.about img {
+				align-self: center;
+				width: 100px;
+				height: 100px;
+				display: block;
+			}
+			
+			.about div {
+				margin-left: 70px;
+			}
+			
+			.source {
+				max-width: 77%;
+				margin-left: auto;
+				font-size: 0.9em;
+				font-style: italic;
+				page-break-inside: avoid;
+			}
+			
+			#specs {
+				font-size: 0.9em;
+			}
+		</style>
+	</head>
+	<body>
+	<h1>$title</h1>
+	
+	<h2>About the report and the author</h2>
+	
+	<p>This report details resource usage and power consumption of the CARI daemon over time as new blocks are added to the CARI blockchain.</p>
+	
+	<div class="about box"><img src="$logo" width="128" height="128" alt="" /><div>Carbon Reduction Initiative Ltd (CRI) aims to offset the carbon footprint of the Bitcoin network by implementing a low-energy, decentralised, masternode blockchain. In a world-first achievement, it will actually be certified to enable the production of carbon credits, based on a unique, proprietary cryptocurrency carbon credit methodology. It will be established as the first blockchain that can generate carbon offsets to directly counter the carbon footprint of Bitcoin.</div></div>
+	
+	<h2>Methodology</h2>
+	
+	<h3>Power consumption</h3>
+	
+	<p>Power consumption of the CARI daemon is based on the CPU power consumption because it's by far the most energy consuming component. The CARI daemon doesn't use any graphics processing unit (GPU) or specialized hardware. The consumption from other components is negligible, as briefly explained in the following sections.</p>
+	
+	<h4>Disk power consumption</h4>
+	
+	The 3.84&nbsp;TB solid-state drive from the <a href="https://www.kingston.com/en/ssd/dc500-data-center-solid-state-drive?model=mixed-use&capacity=3.84tb">Kingston's Data Center 500 Series</a> has the following typical specifications for SSDs:</p>
+	
+	<ul>
+		<li>Power Consumption:
+		<ul>
+			<li>Idle: 1.3&nbsp;W</li>
+			<li>Read: average: 1.45&nbsp;W | max: 1.65&nbsp;W</li>
+			<li>Write: average: 4.5&nbsp;W | max: 7.5&nbsp;W</li>
+		</ul></li>
+		<li>Speed:
+		<ul>
+			<li>Sequential read speed: 529&nbsp;MiB/s (555&nbsp;MB/s)</li>
+			<li>Sequential write speed: 495&nbsp;MiB/s (520&nbsp;MB/s)</li>
+		</ul></li>
+	</ul>
+	
+	<p>Disk activity for the CARI daemon is about 0.5&nbsp;KiB/s reading from disk and 0.5&nbsp;KiB/s writing to disk. Proportionally, the calculated power consumption is negligible (about 0.005% of the CPU consumption):</p>
+	
+	<ul>
+		<li>Read: <code>0.5 / 1024 / 529 * 1.65 = 0.000001523 W</code></li>
+		<li>Write: <code>0.5 / 1024 / 495 * 7.5 = 0.000007398 W</code></li>
+		<li>Total: <code>0.000001523 + 0.000007398 = 0.000008921 W</code></li>
+	</ul>
+	
+	<h4>Network card power consumption</h4>
+	
+	<p>As an example, the <a href="https://www.fs.com/products/75603.html">Intel 25 Gigabit SFP28 network interface card</a> has a speed of 3125&nbsp;MiB/s (25&nbsp;Gb/s) for a max power consumption of 14.1&nbsp;W. The CARI daemon receives about 2&nbsp;KiB of data per second and sends also about 2&nbsp;KiB of data per second. Proportionally, the calculated power consumption is negligible (about 0.01% of the CPU consumption):</p>
+	
+	<p><code>(2 + 2) / 1024 / 3125 * 14.1 = 0.000017625 W</code></p>
+	
+	<h4>DRAM power consumption</h4>
+	
+	<p>DRAM (Dynamic Random Access Memory) is a volatile memory that needs to be refreshed periodically. It means that DRAM modules consume energy independently of the activity of the processes. Although the DRAM power consumption is higher than that of the disk and the network card, it's still much smaller than that of the CPU.</p>
+	
+	<p>The power consumption of DRAM modules depend on their underlying technology. The Samsung high-density <a href="https://samsungatfirst.com/256gb-ddr4-rdimm/">256 GiB DDR4 RDIMM</a> for data centers, first announced in 2018, has a max power consumption of 15&nbsp;W. RAM usage for the CARI daemon is about 125&nbsp;MiB. Proportionally, the calculated power consumption is negligible (about 4.3% of the CPU consumption):</p>
+	
+	<p><code>125 / 1024 / 256 * 15 = 0.007152557 W</code></p>
+	
+	<p>Even without this specialized and next-generation memory module for data centers, the DRAM power consumption for the CARI daemon is still low when calculated for the older DDR3 generation. According to <a href="https://www.eurecom.fr/~appuswam/files/damon15-memory.pdf">Appuswamy et al, 2015</a>, DDR3 RDIMM modules have a loaded consumption of 0.2&nbsp;W/GiB and idle consumption of 0.04&nbsp;W/GiB. Calculating the CARI daemon consumption using a mix of these two values gives only 8.8% of the CPU consumption:</p>
+	
+	<p><code>125 / 1024 * (0.04 + 0.2) / 2 = 0.014648438 W</code></p>
+	
+	<p>It's worth noting that DDR3 modules are more energy consuming than DDR4 modules because they operate at a voltage of 1.5&nbsp;V instead of 1.2&nbsp;V for DDR4, and they're near phased out, representing only <a href="https://www.statista.com/statistics/553383/worldwide-dram-market-share-by-architecture/">8% of the market share</a> in 2021, compared to 90% for DDR4.
+	
+	<h3>CPU usage</h3>
+	
+	<p>CPU usage in percent is measured with the monitoring tool <a href="https://github.com/sysstat/sysstat">pidstat</a> from the package <code>sysstat</code>. It's not strictly needed since the power consumption is measured independently with another monitoring tool, but it allows to verify the strong correlation between the CPU usage and its power consumption.</p>
+	
+	<p>CPU power consumption is calculated thanks to the <a href="https://01.org/blogs/2014/running-average-power-limit-%E2%80%93-rapl">RAPL</a> (Running Average Power Limit) interface. This Intel technology is accessed by loading the module <a href="https://github.com/torvalds/linux/blob/master/drivers/powercap/intel_rapl_common.c">intel_rapl_common</a> on the Linux kernel, then using the metrology agent <a href="https://github.com/hubblo-org/scaphandre">scaphandre</a> (an actively developed program to measure the power consumption of tech services).</p>
+	
+	<p>The RAPL interface has been the subject of several scientific publications to validate the energy consumption data provided, as in Khan et al., 2018:</p>
+	
+	<blockquote>RAPL provides power limiting features and accurate energy readings for CPUs and DRAM which are easily accessible through different interfaces on large distributed computing systems. Since its introduction, RAPL has been used extensively in power measurement and modeling. However, the advantages and disadvantages of RAPL have not been well investigated yet. To fill this gap, we conduct a series of experiments to disclose the underlying strengths and weaknesses of the RAPL interface by using both customized microbenchmarks and three well-known application level benchmarks:Stream, Stress-ng and ParFullCMS. [...] Our observations reveal that RAPL readings are highly correlated with plug power, promisingly accurate enough and have negligible performance overhead. Experimental results suggest RAPL can be a very useful tool to measure and monitor the energy consumption of servers without deploying any complex power meters.</blockquote>
+	
+	<div class="source">– Khan, K. N., Hirki, M., Niemi, T., Nurminen, J. K., & Ou, Z. (2018). RAPL in Action: Experiences in Using RAPL for Power Measurements. ACM Transactions on Modeling and Performance Evaluation of Computing Systems (TOMPECS). 3. 10.1145/3177754. Online on <a class="url" href="https://www.researchgate.net/publication/322308215_RAPL_in_Action_Experiences_in_Using_RAPL_for_Power_Measurements">ResearchGate</a>.</div>
+	
+	<h3>Disk usage</h3>
+	
+	<p>Disk space used by the CARI daemon directory (containing among others a copy of the blockchain) is taken with the command <a href="https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html">du</a>, part of the <code>GNU coreutils</code> package.</p>
+	
+	<p>About data traffic (data read from disk and written to disk), analysis is done with <code>pidstat</code>.</p>
+	
+	<h3>Memory usage</h3>
+	
+	<p>RAM (physical memory) and swap (virtual memory on disk) usage is retrieved by parsing data accessible in <code>/proc/\$CARI_DAEMON_PID/status</code>, that is a file in the <a href="https://www.kernel.org/doc/html/latest/filesystems/proc.html">proc pseudo-filesystem</a> (allowing to access internal data structures about the Linux kernel and processes).</p>
+	
+	<h3>Network usage</h3>
+	
+	<p>About data received and sent by the CARI daemon, the networking monitoring tool <a href="https://github.com/raboof/nethogs">nethogs</a> is used.</p>
+	
+	<h3>New blocks on the CARI blockchain</h3>
+	
+	<p>To prevent increasing CARI daemon resource usage during the experiments, the current block count is not retrieved periodically with the CLI command <code>getblockcount</code>. Instead the daemon is launched with the argument <code>-blocknotify</code>, allowing to get notified by the daemon itself only when a new block is added. The time of the notification is recorded in order to analyze resource usage when new blocks are added.</p>
+	
+	<h3>Duration and hardware specifications</h3>
+	
+	<p>Experiments were conducted with <a href="https://github.com/Carbon-Reduction-Initiative/cari-cons">cari-cons</a> on $report_date for a total duration of $total_duration&nbsp;seconds. Data was retrieved every $step_text on the following hardware specifications:</p>
+	
+	<div id="specs">
+		$(convert_text_list_to_html "$raw_specs")
+	</div>
+	
+	<h2>Results</h2>
+	
+	<h3>Calculated averages</h3>
+	
+	<p>Here are the calculated averages from the raw data:</p>
+	
+	$(cat "${LOC[tmp]}/report-averages.html")
+	
+	<h3>Raw data</h3>
+	
+	<p>The raw data is attached in TXT format to the current PDF document.</p>
+	
+	<h3>Graphs</h3>
+	
+	<p>Below are the graphs generated from the raw data. They are displayed horizontally, then vertically.</p>
+	
+	<img class="report first" src="${LOC[report]}/img/gnuplot:cpu.png" alt="" />
+	
+	<img class="report" src="${LOC[report]}/img/gnuplot:disk.png" alt="" />
+	
+	<img class="report" src="${LOC[report]}/img/gnuplot:memory.png" alt="" />
+	
+	<img class="report last" src="${LOC[report]}/img/gnuplot:traffic.png" alt="" />
+	
+	<p>The same four graphs are displayed vertically below:</p>
+	
+	<img class="report vertical" src="${LOC[report]}/img/gnuplot:cpu-v.png" alt="" />
+	
+	<img class="report vertical" src="${LOC[report]}/img/gnuplot:disk-v.png" alt="" />
+	
+	<img class="report vertical" src="${LOC[report]}/img/gnuplot:memory-v.png" alt="" />
+	
+	<img class="report vertical" src="${LOC[report]}/img/gnuplot:traffic-v.png" alt="" />
+	
+	</body>
+	</html>
+	HEREDOC
+}
+
+# Get the timestamp of a date entry in the main report.
+get_timestamp_report_entry() {
+	local report_line=$1
+	
+	local line_date timestamp
+	
+	# ------------------
+	
+	line_date=${report_line%% *}
+	line_date=${line_date%:*}
+	line_date=${line_date//_/ }
+	timestamp=$(date -d "$line_date" +"%s.%3N")
+	
+	echo -n "$timestamp"
+}
+
+# Install the specified packages and log all installed packages, including dependencies.
+install_packages() {
+	local packages=("$@")
+	
+	local all_packages dry_run name
+	
+	# ------------------
+	
+	if [[ ${packages[0]} =~ ^"." ]]; then
+		name=${packages[0]:1}
+		packages=("${packages[@]:1}")
+	else
+		name=${packages[0]}
+	fi
+	
+	log "Installing dependencies for \"$name\"."
+	
+	dry_run=$(apt-get install --dry-run "${packages[@]}")
+	all_packages=$(grep -oPz "The following NEW packages will be installed:\K(\n\s+[^\n]+)+" <<< "$dry_run" | \
+	               sed -E "s/^\s+//g; s/ /\n/g; /^$/d")
+	all_packages+=$N
+	all_packages+=$(cat "${LOC[installed_packages_file]}")
+	
+	echo -n "$all_packages" | sort -u > "${LOC[installed_packages_file]}"
+	
+	apt-get install -y "${packages[@]}"
+}
+
+# Install the CARI wallet.
+install_wallet() {
+	local filename msg_err tar_exit_status v wallet_url working_folder
+	
+	# ------------------
+	
+	if ! is exec "${LOC[cli_file]}" || ! is exec "${LOC[daemon_file]}"; then
+		log "Downloading the CARI wallet."
+		working_folder=$(pwd)
+		cd -- "${LOC[tmp]}" || exit_script 1 "Can't enter \"${LOC[tmp]}\"."
+		
+		v=${HOST_INFO[main_os_version]}
+		
+		if [[ -n ${LOC[wallet_${v}_url]} ]]; then
+			wallet_url=${LOC[wallet_${v}_url]}
+			filename=${wallet_url##*/}
+			wget -q -O "${LOC[tmp]}/$filename" "$wallet_url"
+			
+			if [[ -f "${LOC[tmp]}/$filename" ]]; then
+				mkdir -p "${LOC[wallet]}"
+				tar xzf "$filename" -C "${LOC[wallet]}/" 2> /dev/null
+				tar_exit_status=$?
+				cd -- "$working_folder" || exit_script 1 "Can't enter \"$working_folder\"."
+				
+				if [[ $tar_exit_status != 0 ]] || ! is exec "${LOC[cli_file]}" || ! is exec "${LOC[daemon_file]}"; then
+					msg_err="Error while installing the ${CRYPTO[name]} wallet."
+					
+					if [[ $tar_exit_status != 0 ]]; then
+						msg_err+=" tar exit status is $tar_exit_status."
+					fi
+				fi
+				
+				rm "${LOC[tmp]}/$filename"
+			else
+				msg_err="Can't download \"$wallet_url\"."
+			fi
+		else
+			msg_err="Can't find the wallet URL for ${HOST_INFO[os]} ${HOST_INFO[os_version]}."
+		fi
+		
+		if [[ -n $msg_err ]]; then
+			exit_script 1 "$msg_err"
+		fi
+	fi
+}
+
+# Test if the data type specified in the first argument matches the content passed in the
+# second argument. Example:
+#     is float 2.5
+is() {
+	local type=$1
+	local var=$2
+	local option=$3
+	
+	local include_zero
+	
+	# ------------------
+	
+	if [[ $type == "bool" ]]; then
+		[[ $var == true || $var == false ]]
+	elif [[ $type == "exec" ]]; then
+		[[ -f $var && -x $var ]]
+	elif [[ $type == "float" ]]; then
+		is pos_int "$var" true || is neg_int "$var" || [[ $var =~ ^-?(0|[1-9][0-9]*)\.[0-9]+$ ]]
+	elif [[ $type == "neg_int" || $type == "pos_int" ]]; then
+		include_zero=$option
+		
+		if ! is bool "$include_zero"; then
+			include_zero=false
+		fi
+		
+		if [[ $type == "neg_int" ]]; then
+			if [[ $include_zero == true ]]; then
+				[[ $var =~ ^(0|-[1-9][0-9]*)$ ]]
+			else
+				[[ $var =~ ^-[1-9][0-9]*$ ]]
+			fi
+		elif [[ $type == "pos_int" ]]; then
+			if [[ $include_zero == true ]]; then
+				[[ $var =~ ^(0|[1-9][0-9]*)$ ]]
+			else
+				[[ $var =~ ^[1-9][0-9]*$ ]]
+			fi
+		fi
+	elif [[ $type == "user" ]]; then
+		if [[ $var == "root" ]]; then
+			[[ $EUID == 0 ]]
+		else
+			[[ $var == "$(whoami)" ]]
+		fi
+	fi
+}
+
+# Load the specified Linux kernel module.
+load_kernel_module() {
+	local module=$1
+	
+	# ------------------
+	
+	if [[ -z $(find "/lib/modules/$(uname -r)" -type f -name "$module.ko") ]]; then
+		log "Loading the Linux kernel module \"$module\"."
+		modprobe "$module"
+	fi
+}
+
+# Display log info.
+log() {
+	local content=$1
+	
+	local current_time
+	
+	# ------------------
+	
+	current_time=$(date +"${FORMAT[date]}")
+	
+	echo "${FORMAT[color_green_bg]}$current_time: LOG: $content${FORMAT[color_default]}"
+}
+
+# Optimize PNG to reduce the size.
+optimize_png() {
+	declare -a images=("$@")
+	
+	local image_tmp
+	
+	# ------------------
+	
+	parallel pngcrush -brute -rem alla -rem text -rem time -rem gAMA -rem cHRM -rem iCCP -rem sRGB {} {}.tmp-png ::: "${images[@]}" &> /dev/null
+	
+	for image_tmp in "${images[@]/%/.tmp-png}"; do
+		if [[ -f $image_tmp ]]; then
+			mv "$image_tmp" "${image_tmp%.tmp-png*}"
+		fi
+	done
+}
+
+# Repeat the specified character "$nb" times.
+repeat_char() {
+	local char=$1
+	local nb=$2
+	
+	# ------------------
+	
+	if [[ -n $char ]] && is pos_int "$nb"; then
+		printf -- "$char%.0s" $(seq "$nb")
+	fi
+}
+
+# Replace each block hash with its corresponding block height.
+replace_block_hashes() {
+	local block_hash block_height content line line_without_hash
+	
+	# ------------------
+	
+	while IFS="" read -r line || [[ -n $line ]]; do
+		line_without_hash=${line% *}
+		block_hash=${line##* }
+		block_height=$("${LOC[cli_file]}" -conf="${LOC[wallet_data]}/cari.conf" -datadir="${LOC[wallet_data]}" getblock "$block_hash" 2> /dev/null | \
+		               grep -oP "^ +\"height\": \K[1-9][0-9]*")
+		
+		if is pos_int "$block_height"; then
+			content+="$line_without_hash $block_height$N"
+		else
+			content+=$line$N
+		fi
+	done < "${LOC[tmp]}/report:blocks.txt"
+	
+	echo -n "$content" > "${LOC[tmp]}/report:blocks.txt"
+}
+
+# Stress test the processor.
+stress_test_cpu() {
+	local duration=$1
+	local nb_workers=$2
+	
+	# ------------------
+	
+	if ! is pos_int "$duration"; then
+		duration=60
+	fi
+	
+	if ! is pos_int "$nb_workers"; then
+		nb_workers=1
+	fi
+	
+	stress-ng -c "$nb_workers" -l 100 -t "$duration"
+}
+
+# Display a timer of "$s" seconds on the standard output.
+timer() {
+	local s=$1
+	
+	local content content_next i
+	
+	if ! is pos_int "$s" true; then
+		s=0
+	fi
+	
+	# ------------------
+	
+	if ((s > 0)); then
+		content+="Waiting $s"
+		
+		if [[ $s == 1 ]]; then
+			content+=" second:"
+		else
+			content+=" seconds:"
+		fi
+		
+		echo -n "$content"
+		
+		for ((i = 1; i <= s; i++)); do
+			if [[ -z $content ]]; then
+				echo -n "$i"
+				content+=$i
+			else
+				echo -n " $i"
+				content+=" $i"
+			fi
+			
+			content_next="$content $((i + 1))"
+			
+			if ((${#content_next} > FORMAT[max_width])); then
+				echo
+				content=""
+			fi
+			
+			sleep 1
+		done
+		
+		echo
+	fi
+}
+
+# Trim the content passed using a pipe:
+# 
+#     some_command | trim
+# 
+# or as the first argument:
+# 
+#     trim " content... "
+trim() {
+	local content
+	
+	if [[ $# == 0 ]]; then
+		content=$(cat; echo z)
+		content=${content%z}
+	else
+		content=$1
+	fi
+	
+	# ------------------
+	
+	echo -n "$content" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# Wait for the termination of all subprocesses needed to generate the final report.
+wait_report() {
+	local file
+	
+	# ------------------
+	
+	if [[ ! -e "${LOC[tmp]}/info:stopped.txt" ]]; then
+		wait "${PIDS_SET_1[@]}"
+		
+		for file in "${LOC[tmp]}/raw:blocks.txt" "${LOC[tmp]}/raw:pidstat.txt" \
+		            "${LOC[tmp]}/raw:nethogs.txt" "${LOC[tmp]}/raw:scaphandre.txt"; do
+			echo "stop" >> "$file"
+		done
+		
+		wait "${PIDS_SET_2[@]}"
+		
+		if [[ ${SETTINGS[enable_cem]} == true ]]; then
+			kill -s USR1 "$PID_CEM"
+			pkill -TERM -P "$PID_CEM"
+		fi
+		
+		touch "${LOC[tmp]}/info:stopped.txt"
+	fi
+}
+
+################################################################################
+# EXPORTS
+################################################################################
+
+export LANG="C"
+export LC_NUMERIC="C"
+
+################################################################################
+# CONSTANTS, 1 of 2
+################################################################################
+
+# Format
+########
+
+N=$'\n'
+declare -r N
+
+declare -A FORMAT
+FORMAT[color_green_bg]=$'\033[1;42m'
+FORMAT[color_red_bg]=$'\033[1;41m'
+FORMAT[color_default]=$(tput sgr0 2> /dev/null)
+FORMAT[date]="%Y-%m-%d_%H:%M:%S.%3N"
+FORMAT[max_width]=80
+FORMAT[sep1]=$(repeat_char "#" "${FORMAT[max_width]}")
+FORMAT[sep2]=$(repeat_char "-" "${FORMAT[max_width]}")
+declare -r FORMAT
+
+################################################################################
+# ARGUMENTS / SETTINGS
+################################################################################
+
+declare -A SETTINGS
+SETTINGS[enable_cem]=      # enable cpu-energy-meter | -c
+SETTINGS[help]=            # display help | -h
+SETTINGS[enable_psr]=      # enable psrecord | -p
+SETTINGS[generate_report]= # generate the report using the specified files | -r
+SETTINGS[step_duration]=   # in seconds | -s
+SETTINGS[total_duration]=  # in seconds | -t
+SETTINGS[upload_report]=   # upload the report to transfer.sh | -u
+SETTINGS[stress_test]=     # stress test the CPU | -z
+
+while getopts ':chpr:s:t:uz' opt; do
+	case "${opt}" in
+		c)
+			SETTINGS[enable_cem]=true
+			;;
+		
+		h)
+			SETTINGS[help]=true
+			;;
+		
+		p)
+			SETTINGS[enable_psr]=true
+			;;
+		
+		r)
+			SETTINGS[generate_report]=$OPTARG
+			;;
+		
+		s)
+			SETTINGS[step_duration]=$OPTARG
+			;;
+		
+		t)
+			SETTINGS[total_duration]=$OPTARG
+			;;
+		
+		u)
+			SETTINGS[upload_report]=true
+			;;
+		
+		z)
+			SETTINGS[stress_test]=true
+			;;
+		
+		*)
+			exit_script 1 "Invalid arguments. Run \"${0##*/} -h\" for help."
+			;;
+	esac
+done
+
+# -c
+if ! is bool "${SETTINGS[enable_cem]}"; then
+	SETTINGS[enable_cem]=false
+fi
+
+# -h
+if ! is bool "${SETTINGS[help]}"; then
+	SETTINGS[help]=false
+fi
+
+# -p
+if ! is bool "${SETTINGS[enable_psr]}"; then
+	SETTINGS[enable_psr]=false
+fi
+
+# -r
+if [[ -n ${SETTINGS[generate_report]} && ! -d ${SETTINGS[generate_report]} && \
+      ! (-f ${SETTINGS[generate_report]} && ${SETTINGS[generate_report]} =~ ".zip"$) ]]; then
+	exit_script 1 "The path \"${SETTINGS[generate_report]}\" specified with the argument \"-r\" is invalid."
+fi
+
+# -s
+if ! is pos_int "${SETTINGS[step_duration]}"; then
+	SETTINGS[step_duration]=2
+fi
+
+# -t
+if ! is pos_int "${SETTINGS[total_duration]}"; then
+	SETTINGS[total_duration]=300
+fi
+
+# -u
+if ! is bool "${SETTINGS[upload_report]}"; then
+	SETTINGS[upload_report]=false
+fi
+
+# -z
+if ! is bool "${SETTINGS[stress_test]}"; then
+	SETTINGS[stress_test]=false
+fi
+
+################################################################################
+# CONSTANTS, 2 of 2
+################################################################################
+
+# LOCATIONS
+###########
+
+# By default, without any key suffix (ex.: "${LOC[script]}"), values are
+# paths to directories. If keys have the suffix "_file" (ex.: "${LOC[script_file]}"),
+# values are paths to files. If keys have the suffix "_url" (ex.: "${LOC[bc1_url]}"),
+# values are URL.
+
+declare -A LOC
+
+LOC[script_file]=$(readlink -m "$(type -p "$0")")
+LOC[script]=${LOC[script_file]%/*}
+
+LOC[apps]="${LOC[script]}/apps"
+LOC[reports]="${LOC[script]}/reports"
+
+if [[ -n ${SETTINGS[generate_report]} ]]; then
+	LOC[tmp]="${LOC[script]}/tmp-r"
+else
+	LOC[tmp]="${LOC[script]}/tmp"
+fi
+
+LOC[installed_packages_file]="${LOC[apps]}/installed-packages.txt"
+
+LOC[report]="${LOC[reports]}/$(date +"%Y-%m-%d_%H:%M:%S")"
+LOC[report_img]="${LOC[report]}/img"
+
+LOC[wallet]="${LOC[apps]}/cari-wallet"
+LOC[wallet_data]="${LOC[wallet]}/datadir"
+LOC[cli_file]="${LOC[wallet]}/cari-cli"
+LOC[daemon_file]="${LOC[wallet]}/carid"
+
+LOC[cem]="${LOC[apps]}/cpu-energy-meter"
+LOC[cem_file]="${LOC[cem]}/cpu-energy-meter"
+
+LOC[nethogs]="${LOC[apps]}/nethogs"
+LOC[nethogs_file]="${LOC[nethogs]}/src/nethogs"
+
+LOC[psrecord]="${LOC[apps]}/psrecord"
+LOC[psrecord_file]="${LOC[psrecord]}/bin/psrecord"
+
+LOC[scaphandre]="${LOC[apps]}/scaphandre"
+LOC[scaphandre_file]="${LOC[scaphandre]}/target/release/scaphandre"
+
+LOC[weasyprint]="${LOC[apps]}/weasyprint"
+LOC[weasyprint_file]="${LOC[weasyprint]}/bin/weasyprint"
+
+LOC[bc1_url]="https://cari-explorer.projectmerge.org/api/getblockcount"
+LOC[bc2_url]="https://explorer.cri.eco/api/getblockcount"
+
+LOC[wallet_16_url]="https://github.com/Carbon-Reduction-Initiative/CARI/releases/download/CARIv1.1.0/CARI-v1.1.0-linux-ubuntu16.tar.gz"
+LOC[wallet_18_url]="https://github.com/Carbon-Reduction-Initiative/CARI/releases/download/CARIv1.1.0/CARI-v1.1.0-linux-ubuntu18.tar.gz"
+LOC[wallet_20_url]="https://notifs.cri.eco/download/CARI-v1.0.2-linux-ubuntu20.tar.gz"
+LOC[wallet_21_url]=${LOC[wallet_20_url]}
+
+declare -r LOC
+
+# Manual settings
+#################
+
+SETTINGS[display_unknown]=false
+SETTINGS[blocknotify_arg]="echo %s >> ${LOC[tmp]}/raw:blocks.txt"
+
+declare -r SETTINGS
+
+################################################################################
+# GLOBAL VARIABLES
+################################################################################
+
+declare -A AVG
+declare -A DAEMON_INFO
+declare -A HOST_INFO
+
+PID_CEM=
+PIDS_SET_1=()
+PIDS_SET_2=()
+
+################################################################################
+# CHECKS AND DEPENDENCIES
+################################################################################
+
+# root
+if ! is user root; then
+	exit_script 1 "The current user is \"$(whoami)\". You must run this script as root."
+fi
+
+# directories
+
+for loc in "${!LOC[@]}"; do
+	if [[ ! $loc =~ (_url|_file)$ && ! -e ${LOC[$loc]} ]]; then
+		if [[ ($loc == "report" || $loc == "report_img") && (${SETTINGS[help]} == true || ${SETTINGS[stress_test]} == true) ]]; then
+			continue
+		fi
+		
+		mkdir -p "${LOC[$loc]}"
+	fi
+done
+
+adjust_file_permissions
+
+# dmidecode
+if ! command_exists "dmidecode"; then
+	install_packages dmidecode
+fi
+
+# lshw
+if ! command_exists "lshw"; then
+	install_packages lshw
+fi
+
+# route
+if ! command_exists "route"; then
+	install_packages .route net-tools
+fi
+
+# smartctl
+if ! command_exists "smartctl"; then
+	install_packages .smartctl smartmontools
+fi
+
+get_host_info
+
+# OS compatibility
+if [[ ${HOST_INFO[os]} != "Ubuntu" ]]; then
+	exit_script 1 "This script only supports Ubuntu."
+elif [[ ! ${HOST_INFO[os_version]} =~ ^(16|18|20|21) ]]; then
+	exit_script 1 "Your Ubuntu version is not supported."
+fi
+
+# CARI wallet
+
+install_wallet
+
+if [[ ! -f ${LOC[cli_file]} || ! -x ${LOC[cli_file]} ]]; then
+	exit_script 1 "The CARI cli path \"${LOC[cli_file]}\" is not valid."
+fi
+
+if [[ ! -f ${LOC[daemon_file]} || ! -x ${LOC[daemon_file]} ]]; then
+	exit_script 1 "The CARI daemon path \"${LOC[daemon_file]}\" is not valid."
+fi
+
+if [[ ! -d ${LOC[wallet_data]} ]]; then
+	exit_script 1 "The CARI data directory \"${LOC[wallet_data]}\" is not valid."
+fi
+
+# git
+if ! command_exists "git"; then
+	install_packages git
+fi
+
+# cpu-energy-meter
+if [[ ${SETTINGS[enable_cem]} == true ]]; then
+	load_kernel_module "msr"
+	load_kernel_module "cpuid"
+	
+	if [[ ! -f ${LOC[cem_file]} ]]; then
+		install_packages .cpu-energy-meter build-essential libcap-dev
+		cd "${LOC[apps]}" || exit_script 1 "Can't enter \"${LOC[apps]}\"."
+		git clone https://github.com/sosy-lab/cpu-energy-meter.git
+		cd "${LOC[cem]}" || exit_script 1 "Can't enter \"${LOC[cem]}\"."
+		make
+	fi
+fi
+
+# curl
+if [[ ${SETTINGS[upload_report]} == true ]]; then
+	if ! command_exists "curl"; then
+		install_packages curl
+	fi
+fi
+
+# gnuplot
+if ! command_exists "gnuplot-nox"; then
+	install_packages .gnuplot gnuplot-nox
+fi
+
+# inotify-tools
+if ! command_exists "inotifywait"; then
+	install_packages .inotifywait inotify-tools
+fi
+
+# nethogs
+if [[ ! -f ${LOC[nethogs_file]} ]]; then
+	install_packages .nethogs build-essential libncurses5-dev libpcap-dev libdbus-1-dev
+	cd "${LOC[apps]}" || exit_script 1 "Can't enter \"${LOC[apps]}\"."
+	git clone https://github.com/raboof/nethogs
+	cd "${LOC[nethogs]}" || exit_script 1 "Can't enter \"${LOC[nethogs]}\"."
+	make
+fi
+
+# parallel
+if ! command_exists "parallel"; then
+	install_packages parallel
+fi
+
+# pdftk
+if ! command_exists "pdftk" && [[ -n $(apt-cache search --names-only "^pdftk$") ]]; then
+	install_packages .pdftk pdftk-java
+fi
+
+# pidstat
+if ! command_exists "pidstat"; then
+	install_packages .pidstat sysstat
+fi
+
+# pngcrush
+if ! command_exists "pngcrush"; then
+	install_packages pngcrush
+fi
+
+# psrecord
+if [[ ${SETTINGS[enable_psr]} == true ]]; then
+	export PYTHONPATH="$PYTHONPATH:${LOC[psrecord]}"
+	
+	if [[ ! -f ${LOC[psrecord_file]} ]]; then
+		mkdir -p "${LOC[psrecord]}"
+		install_packages .psrecord python3-matplotlib python3-pip
+		pip3 install --target="${LOC[psrecord]}" psrecord
+	fi
+fi
+
+# scaphandre
+
+if [[ ${HOST_INFO[kernel_version]} =~ ^"4." ]]; then
+	if [[ ! -f "/lib/modules/${HOST_INFO[kernel_version]}/kernel/drivers/powercap/intel_rapl.ko" ]]; then
+		install_packages .scaphandre "linux-modules-extra-${HOST_INFO[kernel_version]}"
+	fi
+	
+	load_kernel_module "intel_rapl"
+elif [[ ${HOST_INFO[kernel_version]} =~ ^"5." ]]; then
+	if [[ ! -f "/lib/modules/${HOST_INFO[kernel_version]}/kernel/drivers/powercap/intel_rapl_common.ko" ]]; then
+		install_packages .scaphandre "linux-modules-extra-${HOST_INFO[kernel_version]}"
+	fi
+	
+	load_kernel_module "intel_rapl_common"
+fi
+
+if [[ ! -f ${LOC[scaphandre_file]} ]]; then
+	install_packages .scaphandre cargo libssl-dev #linux-tools-common linux-tools-generic
+	cd "${LOC[apps]}" || exit_script 1 "Can't enter \"${LOC[apps]}\"."
+	git clone https://github.com/hubblo-org/scaphandre.git
+	cd "scaphandre" || exit_script 1 "Can't enter \"${LOC[scaphandre]}\"."
+	cargo build --release
+fi
+
+# stress test
+if [[ ${SETTINGS[stress_test]} == true ]]; then
+	if ! command_exists "stress-ng"; then
+		install_packages stress-ng
+	fi
+fi
+
+# weasyprint
+
+export PYTHONPATH="$PYTHONPATH:${LOC[weasyprint]}"
+
+if [[ ! -f ${LOC[weasyprint_file]} ]]; then
+	mkdir -p "${LOC[weasyprint]}"
+	install_packages .weasyprint python3-pip python3-cffi python3-brotli libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0 libjpeg8-dev zlib1g-dev
+	pip3 install --target="${LOC[weasyprint]}" weasyprint
+fi
+
+# zip
+if ! command_exists "zip"; then
+	install_packages zip
+fi
+
+# unzip
+if ! command_exists "unzip"; then
+	install_packages unzip
+fi
+
+################################################################################
+# SCRIPT
+################################################################################
+
+# Help
+######
+
+if [[ ${SETTINGS[help]} == true ]]; then
+	display_help
+	
+	exit_script
+fi
+
+# Stress test
+#############
+
+if [[ ${SETTINGS[stress_test]} == true ]]; then
+	stress_test_cpu 60 1
+	
+	exit_script
+fi
+
+if [[ -d ${SETTINGS[generate_report]} ]]; then
+	cp -a "${SETTINGS[generate_report]}/"* "${LOC[tmp]}"
+elif [[ -f ${SETTINGS[generate_report]} && ${SETTINGS[generate_report]} =~ ".zip"$ ]]; then
+	unzip -j -q "${SETTINGS[generate_report]}" -d "${LOC[tmp]}"
+elif [[ -z ${SETTINGS[generate_report]} ]]; then
+	# Clean up the temporary script directory
+	#########################################
+	
+	rm -rf "${LOC[tmp]:?}"/*
+	
+	# CARI daemon
+	#############
+	
+	carid_process=$(pgrep -a carid | head -n 1)
+	start_daemon=false
+	
+	if [[ -z $carid_process || ! $carid_process =~ "${SETTINGS[blocknotify_arg]}" ]]; then
+		start_daemon=true
+		
+		if [[ -n $carid_process && ! $carid_process =~ "${SETTINGS[blocknotify_arg]}" ]]; then
+			log "The CARI daemon is running, but some arguments are missing in order to run the current script. The daemon will be stopped."
+			"${LOC[cli_file]}" -conf="${LOC[wallet_data]}/cari.conf" -datadir="${LOC[wallet_data]}" stop
+			timer 15
+		fi
+	fi
+	
+	pid_daemon=
+	
+	if [[ $start_daemon == true ]]; then
+		log "Starting the CARI daemon."
+		"${LOC[daemon_file]}" -datadir="${LOC[wallet_data]}" -blocknotify="${SETTINGS[blocknotify_arg]}" &> /dev/null &
+		pid_daemon=$!
+		timer 15
+	fi
+	
+	while true; do
+		block_count_local=$(get_block_count local)
+		block_count_blockchain=$(get_block_count blockchain)
+		
+		if [[ $block_count_local == "$block_count_blockchain" ]]; then
+			break
+		fi
+		
+		log "Synchronizing the local database (block $block_count_local) with the blockchain (block $block_count_blockchain)."
+		sleep 15
+	done
+	
+	# Host info
+	###########
+	
+	header_content=${FORMAT[sep1]}${N}${HOST_INFO[text]}
+	
+	# CARI daemon info
+	##################
+	
+	get_daemon_info "$pid_daemon"
+	header_content+=${FORMAT[sep2]}${N}${DAEMON_INFO[text]}
+	header_content+="  - Block count: local: $(get_block_count local) | blockchain: $(get_block_count blockchain)$N"
+	
+	if ! is pos_int "${DAEMON_INFO[pid]}"; then
+		exit_script 1 "Can't find the CARI daemon PID."
+	fi
+	
+	# Settings
+	##########
+	
+	header_content+="${FORMAT[sep2]}${N}+ Settings:$N"
+	header_content+="  - Step duration: ${SETTINGS[step_duration]} s$N"
+	header_content+="  - Total duration: ${SETTINGS[total_duration]} s$N"
+	
+	# Get data
+	##########
+	
+	timer "${SETTINGS[total_duration]}" &
+	PIDS_SET_1+=("$!")
+	
+	# pidstat
+	S_TIME_FORMAT=ISO pidstat -p "${DAEMON_INFO[pid]}" -h -l -d -u "${SETTINGS[step_duration]}" \
+		"$((SETTINGS[total_duration] / SETTINGS[step_duration]))" > "${LOC[tmp]}/raw:pidstat.txt" &
+	PIDS_SET_1+=("$!")
+	
+	# scaphandre
+	
+	vm_arg=""
+	
+	if [[ ${HOST_INFO[virt]} != "none" ]]; then
+		vm_arg="--vm"
+	fi
+	
+	"${LOC[scaphandre_file]}" $vm_arg stdout -r "carid" -s "${SETTINGS[step_duration]}" \
+		-t "$((SETTINGS[total_duration] + 1))" > "${LOC[tmp]}/raw:scaphandre.txt" &
+	PIDS_SET_1+=("$!")
+	
+	# du
+	get_du_data &
+	PIDS_SET_1+=("$!")
+	
+	# nethogs
+	"${LOC[nethogs_file]}" -t -P "${DAEMON_INFO[pid]}" -d "${SETTINGS[step_duration]}" \
+		-c "$((SETTINGS[total_duration] / SETTINGS[step_duration]))" > "${LOC[tmp]}/raw:nethogs.txt" &
+	PIDS_SET_1+=("$!")
+	
+	# proc status
+	get_proc_status_data &
+	PIDS_SET_1+=("$!")
+	
+	# psrecord
+	if [[ ${SETTINGS[enable_psr]} == true ]]; then
+		"${LOC[psrecord_file]}" "${DAEMON_INFO[pid]}" --interval "${SETTINGS[step_duration]}" --duration "${SETTINGS[total_duration]}" \
+		--include-children --log "${LOC[tmp]}/psrecord.txt" --plot "${LOC[tmp]}/psrecord.png" &> /dev/null &
+		PIDS_SET_1+=("$!")
+	fi
+	
+	# cpu-energy-meter
+	if [[ ${SETTINGS[enable_cem]} == true ]]; then
+		touch "${LOC[tmp]}/raw:cem.txt"
+		"${LOC[cem_file]}" -r > "${LOC[tmp]}/raw:cem.txt" &
+		PID_CEM=$!
+	fi
+	
+	generate_report_blocks &
+	PIDS_SET_2+=("$!")
+	
+	generate_report_pidstat &
+	PIDS_SET_2+=("$!")
+	
+	generate_report_nethogs &
+	PIDS_SET_2+=("$!")
+	
+	generate_report_scaphandre &
+	PIDS_SET_2+=("$!")
+	
+	# trap
+	######
+	
+	trap "wait_report; trap - EXIT" EXIT HUP INT QUIT PIPE TERM
+	
+	# Generate the report
+	#####################
+	
+	wait_report
+fi
+
+log "Generating the report..."
+
+if [[ -z ${SETTINGS[generate_report]} ]]; then
+	replace_block_hashes
+	
+	if [[ ${SETTINGS[enable_cem]} == true ]]; then
+		header_content+="${FORMAT[sep1]}${N}cpu-energy-meter report:$N"
+		header_content+=$(tail -n 5 "${LOC[tmp]}/raw:cem.txt" | sed -E "s/^/  - /")$N
+	fi
+	
+	header_content+=${FORMAT[sep1]}$N
+	
+	echo -n "$header_content" > "${LOC[tmp]}/report-header.txt"
+	
+	report_results=$(cat "${LOC[tmp]}/report:"*.txt | grep -v "^stop$")
+	report_results=$(echo -n "$report_results" | sort)$N
+	report_results=$(sed -E "s/^([0-9_:.-]+: block )/${FORMAT[sep2]}\n\1/" <<< "$report_results")
+	
+	echo -n "$report_results" > "${LOC[tmp]}/report-results.txt"
+fi
+
+cat "${LOC[tmp]}/report-header.txt" "${LOC[tmp]}/report-results.txt" > "${LOC[report]}/report.txt"
+
+# Copy secondary reports
+########################
+
+if [[ ${SETTINGS[enable_psr]} == true ]]; then
+	if [[ -f "${LOC[tmp]}/psrecord.png" ]]; then
+		cp "${LOC[tmp]}/psrecord.png" "${LOC[report]}/img/"
+	fi
+	
+	if [[ -f "${LOC[tmp]}/psrecord.txt" ]]; then
+		cp "${LOC[tmp]}/psrecord.txt" "${LOC[report]}"
+	fi
+fi
+
+# Generate plots
+################
+
+generate_plots
+
+for graph in "${LOC[report]}/img/gnuplot:"*.png; do
+	convert "$graph" -rotate 270 "${graph%.*}-v.png"
+done
+
+format_png "${LOC[report]}/img/"*.png
+optimize_png "${LOC[report]}/img/"*.png
+
+# Generate the report in PDF format
+###################################
+
+if [[ -z ${SETTINGS[generate_report]} ]]; then
+	avg_content="CPU usage: ${AVG[CPU usage]}${AVG[CPU usage unit]} (${AVG[CPU usage MHz]} ${AVG[CPU usage MHz unit]})$N"
+	avg_content+="CPU power consumption: ${AVG[CPU power consumption]} ${AVG[CPU power consumption unit]}$N"
+	avg_content+="Read from disk: ${AVG[Read from disk]} ${AVG[Read from disk unit]}$N"
+	avg_content+="Written to disk: ${AVG[Written to disk]} ${AVG[Written to disk unit]}$N"
+	avg_content+="Used disk space: ${AVG[Used disk space]} ${AVG[Used disk space unit]}$N"
+	avg_content+="RAM usage: ${AVG[RAM usage]} ${AVG[RAM usage unit]}$N"
+	avg_content+="Swap usage: ${AVG[Swap usage]} ${AVG[Swap usage unit]}$N"
+	avg_content+="Network traffic received: ${AVG[Network traffic received]} ${AVG[Network traffic received unit]}$N"
+	avg_content+="Network traffic sent: ${AVG[Network traffic sent]} ${AVG[Network traffic sent unit]}$N"
+	
+	cpu_cons_kwh=$(float_calc "${AVG[CPU power consumption]} * 24" 6)
+	cpu_cons_kwh_year=$(float_calc "${AVG[CPU power consumption]} * 24 * 365" 6)
+	
+	avg_raw_data="$N${FORMAT[sep1]}${N}+ Averages calculated from the raw data:$N"
+	avg_raw_data_html="<ul>$N"
+	
+	avg_raw_data+=$(sed "s/^/  - /" <<< "$avg_content")
+	avg_raw_data_html+=$(sed -E "s~^(.+)$~<li>\1</li>~" <<< "$avg_content")
+	
+	avg_raw_data+="${FORMAT[sep2]}$N+ Here's for the energy consumption:$N"
+	avg_raw_data_html+="</ul>$N<p>Here's for the energy consumption:</p>$N<ul>$N"
+	
+	avg_raw_data+="  - For a day: ${AVG[CPU power consumption]} W * 24h = ${cpu_cons_kwh} kWh$N"
+	avg_raw_data_html+="<li>For a day: ${AVG[CPU power consumption]}&nbsp;W * 24h = ${cpu_cons_kwh}&nbsp;kWh</li>$N"
+	
+	avg_raw_data+="  - For a year: $cpu_cons_kwh kWh * 365 = $cpu_cons_kwh_year kWh$N"
+	avg_raw_data_html+="<li>For a year: $cpu_cons_kwh&nbsp;kWh * 365 = $cpu_cons_kwh_year&nbsp;kWh</li>$N"
+	
+	avg_raw_data+=${FORMAT[sep1]}$N
+	avg_raw_data_html+="</ul>$N"
+	
+	echo -n "$avg_raw_data" > "${LOC[tmp]}/report-averages.txt"
+	echo -n "$avg_raw_data_html" > "${LOC[tmp]}/report-averages.html"
+fi
+
+cat "${LOC[tmp]}/report-averages.txt" >> "${LOC[report]}/report.txt"
+
+generate_report_pdf
+
+# File permissions
+##################
+
+adjust_file_permissions
+
+# Backup the raw data
+#####################
+
+cd -- "${LOC[script]}" || exit_script 1 "Can't enter \"${LOC[script]}\"."
+zip -q -r "${LOC[report]}/raw-data.zip" "tmp"
+chmod u=rwX,go=rwX "${LOC[report]}/raw-data.zip"
+
+# Upload the report
+###################
+
+if [[ ${SETTINGS[upload_report]} == true ]]; then
+	curl -H "Max-Downloads: 1" -H "Max-Days: 1" --upload-file "${LOC[report]}/report.pdf" "https://transfer.sh/report-${LOC[report]##*/}.pdf"
+fi
+
+# Clean up the temporary directory (if applicable)
+##################################################
+
+if [[ -n ${SETTINGS[generate_report]} ]]; then
+	rm -rf "${LOC[tmp]:?}"/*
+	rmdir "${LOC[tmp]:?}"
+fi
+
+# Display the report
+####################
+
+cat "${LOC[report]}/report.txt"
