@@ -56,28 +56,28 @@ calc_avg_csv() {
 
 # Calculate averages from the raw data. The global variable "AVG" will be updated.
 calc_avg_from_raw_data() {
-	AVG[CPU usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 2 2)
+	AVG[CPU usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:cpu.csv" 2 2)
 	AVG[CPU usage unit]="%"
-	AVG[CPU usage MHz]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 3 0)
+	AVG[CPU usage MHz]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:cpu.csv" 3 0)
 	AVG[CPU usage MHz unit]="MHz"
-	AVG[CPU power consumption]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:cpu.csv" 4 6)
+	AVG[CPU power consumption]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:cpu.csv" 4 6)
 	AVG[CPU power consumption unit]="W"
 	
-	AVG[Read from disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 2 2)
+	AVG[Read from disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:disk.csv" 2 2)
 	AVG[Read from disk unit]="KiB/s"
-	AVG[Written to disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 3 2)
+	AVG[Written to disk]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:disk.csv" 3 2)
 	AVG[Written to disk unit]="KiB/s"
-	AVG[Used disk space]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:disk.csv" 4 5)
+	AVG[Used disk space]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:disk.csv" 4 5)
 	AVG[Used disk space unit]="MiB"
 	
-	AVG[RAM usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:memory.csv" 2 5)
+	AVG[RAM usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:memory.csv" 2 5)
 	AVG[RAM usage unit]="MiB"
-	AVG[Swap usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:memory.csv" 3 5)
+	AVG[Swap usage]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:memory.csv" 3 5)
 	AVG[Swap usage unit]="MiB"
 	
-	AVG[Network traffic received]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:traffic.csv" 2 6)
+	AVG[Network traffic received]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:traffic.csv" 2 6)
 	AVG[Network traffic received unit]="KiB/s"
-	AVG[Network traffic sent]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:traffic.csv" 3 6)
+	AVG[Network traffic sent]=$(calc_avg_csv "${LOC[tmp]}/gnuplot:csv:traffic.csv" 3 6)
 	AVG[Network traffic sent unit]="KiB/s"
 }
 
@@ -233,7 +233,7 @@ generate_plots() {
 	
 	# ------------------
 	
-	duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
+	duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/txt:header.txt")
 	
 	if ((duration > 3600)); then
 		arrow_start="0.75"
@@ -291,12 +291,12 @@ generate_plots() {
 			traffic_last_time=$elapsed_time
 			traffic_csv+="$elapsed_time,${BASH_REMATCH[1]},${BASH_REMATCH[2]}$N"
 		fi
-	done < "${LOC[report]}/report.txt"
+	done < "${LOC[report_txt_file]}"
 	
-	echo "$cpu_csv" > "${LOC[tmp]}/gnuplot:cpu.csv"
-	echo "$disk_csv" > "${LOC[tmp]}/gnuplot:disk.csv"
-	echo "$memory_csv" > "${LOC[tmp]}/gnuplot:memory.csv"
-	echo "$traffic_csv" > "${LOC[tmp]}/gnuplot:traffic.csv"
+	echo "$cpu_csv" > "${LOC[tmp]}/gnuplot:csv:cpu.csv"
+	echo "$disk_csv" > "${LOC[tmp]}/gnuplot:csv:disk.csv"
+	echo "$memory_csv" > "${LOC[tmp]}/gnuplot:csv:memory.csv"
+	echo "$traffic_csv" > "${LOC[tmp]}/gnuplot:csv:traffic.csv"
 	
 	calc_avg_from_raw_data
 	
@@ -361,9 +361,9 @@ generate_plots() {
 	cpu+="set y2label \"CPU power consumption (W)\" font 'Rising Sun Bold,12'$N"
 	cpu+="set y2range [0:]$N"
 	cpu+="set format y2 \"%.2f\"$N"
-	cpu+="set output '${LOC[report]}/img/gnuplot:cpu.png'$N"
+	cpu+="set output '${LOC[tmp]}/gnuplot:png:cpu.png'$N"
 	
-	cpu+="plot '${LOC[tmp]}/gnuplot:cpu.csv' "
+	cpu+="plot '${LOC[tmp]}/gnuplot:csv:cpu.csv' "
 	cpu+="using 1:2 $smooth with lines ls 3,"
 	cpu+="'' using 1:4 $smooth with lines axis x1y2 ls 5,"
 	cpu+="'' u 1:(${AVG[CPU usage]}) with lines ls 4 t 'Avg CPU usage (${AVG[CPU usage unit]})',"
@@ -388,9 +388,9 @@ generate_plots() {
 	disk+="set y2range [*:*]$N"
 	disk+="set format y2 \"%.5f\"$N"
 	disk+="set key maxrows 3$N"
-	disk+="set output '${LOC[report]}/img/gnuplot:disk.png'$N"
+	disk+="set output '${LOC[tmp]}/gnuplot:png:disk.png'$N"
 	
-	disk+="plot '${LOC[tmp]}/gnuplot:disk.csv' "
+	disk+="plot '${LOC[tmp]}/gnuplot:csv:disk.csv' "
 	disk+="using 1:2 $smooth with lines ls 3,"
 	disk+="'' using 1:3 $smooth with lines ls 5,"
 	disk+="'' using 1:4 $smooth with lines axis x1y2 ls 7,"
@@ -416,9 +416,9 @@ generate_plots() {
 	memory+="set y2label \"Swap usage (MiB)\" font 'Rising Sun Bold,12'$N"
 	memory+="set y2range [0<*:]$N"
 	memory+="set format y2 \"%.3f\"$N"
-	memory+="set output '${LOC[report]}/img/gnuplot:memory.png'$N"
+	memory+="set output '${LOC[tmp]}/gnuplot:png:memory.png'$N"
 	
-	memory+="plot '${LOC[tmp]}/gnuplot:memory.csv' "
+	memory+="plot '${LOC[tmp]}/gnuplot:csv:memory.csv' "
 	memory+="using 1:2 $smooth with lines ls 3,"
 	memory+="'' using 1:3 $smooth with lines axis x1y2 ls 5,"
 	memory+="'' u 1:(${AVG[RAM usage]}) with lines ls 4 t 'Avg RAM usage (${AVG[RAM usage unit]})',"
@@ -440,24 +440,24 @@ generate_plots() {
 	traffic+="set yrange [*:*]$N"
 	traffic+="set format y \"%.1f\"$N"
 	traffic+="unset y2tics$N"
-	traffic+="set output '${LOC[report]}/img/gnuplot:traffic.png'$N"
+	traffic+="set output '${LOC[tmp]}/gnuplot:png:traffic.png'$N"
 	
-	traffic+="plot '${LOC[tmp]}/gnuplot:traffic.csv' "
+	traffic+="plot '${LOC[tmp]}/gnuplot:csv:traffic.csv' "
 	traffic+="using 1:2 $smooth with lines ls 3,"
 	traffic+="'' using 1:3 $smooth with lines ls 5,"
 	traffic+="'' u 1:(${AVG[Network traffic received]}) with lines ls 4 t 'Avg traffic received (${AVG[Network traffic received unit]})',"
 	traffic+="'' u 1:(${AVG[Network traffic sent]}) with lines ls 6 t 'Avg traffic sent (${AVG[Network traffic sent unit]})',"
 	traffic+="1/0 ls 1 t \"New block\"$N"
 	
-	echo "$cpu" > "${LOC[tmp]}/gnuplot:cpu.gnuplot"
-	echo "$disk" > "${LOC[tmp]}/gnuplot:disk.gnuplot"
-	echo "$memory" > "${LOC[tmp]}/gnuplot:memory.gnuplot"
-	echo "$traffic" > "${LOC[tmp]}/gnuplot:traffic.gnuplot"
+	echo "$cpu" > "${LOC[tmp]}/gnuplot:script:cpu.gnuplot"
+	echo "$disk" > "${LOC[tmp]}/gnuplot:script:disk.gnuplot"
+	echo "$memory" > "${LOC[tmp]}/gnuplot:script:memory.gnuplot"
+	echo "$traffic" > "${LOC[tmp]}/gnuplot:script:traffic.gnuplot"
 	
 	# PNG plots
 	###########
 	
-	parallel gnuplot-nox -p {} ::: "${LOC[tmp]}/gnuplot:"*.gnuplot
+	parallel gnuplot-nox -p {} ::: "${LOC[tmp]}/gnuplot:script:"*.gnuplot
 }
 
 # Generate the section of the report related to new blocks on the CARI blockchain.
@@ -520,14 +520,14 @@ generate_report_nethogs() {
 
 # Generate the report in PDF format.
 generate_report_pdf() {
-	get_report_template > "${LOC[tmp]}/report.html"
-	"${LOC[weasyprint_file]}" "${LOC[tmp]}/report.html" "${LOC[report]}/report.pdf"
+	get_report_template > "${LOC[tmp]}/html:report.html"
+	"${LOC[weasyprint_file]}" "${LOC[tmp]}/html:report.html" "${LOC[report_pdf_file]}"
 	
 	if command_exists "pdftk"; then
-		pdftk "${LOC[report]}/report.pdf" attach_files "${LOC[report]}/report.txt" output "${LOC[report]}/report2.pdf"
+		pdftk "${LOC[report_pdf_file]}" attach_files "${LOC[report_txt_file]}" output "${LOC[report]}/report.tmp.pdf"
 		
-		if [[ -f "${LOC[report]}/report2.pdf" ]]; then
-			mv "${LOC[report]}/report2.pdf" "${LOC[report]}/report.pdf"
+		if [[ -f "${LOC[report]}/report.tmp.pdf" ]]; then
+			mv "${LOC[report]}/report.tmp.pdf" "${LOC[report_pdf_file]}"
 		fi
 	fi
 }
@@ -553,7 +553,7 @@ generate_report_pidstat() {
 			new_data=$(awk '{print $8, $10, $11}' <<< "$new_data")
 			cpu_percent=${new_data%% *}
 			disk_r=${new_data% *}
-			disk_r=${disk_r%% *}
+			disk_r=${disk_r##* }
 			disk_w=${new_data##* }
 			content="$time_new_data: CPU usage: ${cpu_percent}% ($(float_calc "$cpu_percent * ${HOST_INFO[avg_cpu_speed]} / 100" 0) MHz)$N"
 			content+="$time_new_data: read: $disk_r KiB/s | written: $disk_w KiB/s$N"
@@ -1141,6 +1141,9 @@ get_proc_status_data() {
 # Get the report template in HTML.
 get_report_template() {
 	local count line logo raw_specs report_date step_text title total_duration
+	local disk_part_cpu disk_w read_from_disk_w written_to_disk_w
+	local network_part_cpu network_w
+	local ram_ddr3_part_cpu ram_ddr3_w ram_samsung_part_cpu ram_samsung_w
 	
 	# ------------------
 	
@@ -1471,10 +1474,10 @@ get_report_template() {
 		fi
 		
 		raw_specs+=$line$N
-	done < "${LOC[report]}/report.txt"
+	done < "${LOC[report_txt_file]}"
 	
 	title="CARI daemon resource usage and power consumption"
-	step_text=$(grep -oP "^  - Step duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
+	step_text=$(grep -oP "^  - Step duration: \K[1-9][0-9]*" "${LOC[tmp]}/txt:header.txt")
 	
 	if [[ $step_text == 1 ]]; then
 		step_text+="&nbsp;second"
@@ -1482,8 +1485,21 @@ get_report_template() {
 		step_text+="&nbsp;seconds"
 	fi
 	
-	total_duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/report-header.txt")
-	report_date=$(LC_TIME=en date -r "${LOC[tmp]}/report-results.txt" +"%B %-d, %Y")
+	total_duration=$(grep -oP "^  - Total duration: \K[1-9][0-9]*" "${LOC[tmp]}/txt:header.txt")
+	report_date=$(LC_TIME=en date -r "${LOC[tmp]}/txt:results.txt" +"%B %-d, %Y")
+	
+	read_from_disk_w=$(float_calc "${AVG[Read from disk]} / 1024 / 529 * 1.65" 9)
+	written_to_disk_w=$(float_calc "${AVG[Written to disk]} / 1024 / 529 * 1.65" 9)
+	disk_w=$(float_calc "$read_from_disk_w + $written_to_disk_w" 9)
+	disk_part_cpu=$(float_calc "$disk_w / ${AVG[CPU power consumption]} * 100" 4)
+	
+	network_w=$(float_calc "(${AVG[Network traffic received]} + ${AVG[Network traffic sent]}) / 1024 / 3125 * 14.1" 9)
+	network_part_cpu=$(float_calc "$network_w / ${AVG[CPU power consumption]} * 100" 4)
+	
+	ram_samsung_w=$(float_calc "${AVG[RAM usage]} / 1024 / 256 * 15" 9)
+	ram_samsung_part_cpu=$(float_calc "$ram_samsung_w / ${AVG[CPU power consumption]} * 100" 1)
+	ram_ddr3_w=$(float_calc "${AVG[RAM usage]} / 1024 * (0.04 + 0.2) / 2" 9)
+	ram_ddr3_part_cpu=$(float_calc "$ram_ddr3_w / ${AVG[CPU power consumption]} * 100" 1)
 	
 	cat <<-HEREDOC
 	<!DOCTYPE html>
@@ -1690,31 +1706,31 @@ get_report_template() {
 		</ul></li>
 	</ul>
 	
-	<p>Disk activity for the CARI daemon is about 0.5&nbsp;KiB/s reading from disk and 0.5&nbsp;KiB/s writing to disk. Proportionally, the calculated power consumption is negligible (about 0.005% of the CPU consumption):</p>
+	<p>During the experiments, disk activity for the CARI daemon was ${AVG[Read from disk]}&nbsp;KiB/s reading from disk and ${AVG[Written to disk]}&nbsp;KiB/s writing to disk. Proportionally, the calculated power consumption is negligible (about $disk_part_cpu% of the CPU consumption):</p>
 	
 	<ul>
-		<li>Read: <code>0.5 / 1024 / 529 * 1.65 = 0.000001523 W</code></li>
-		<li>Write: <code>0.5 / 1024 / 495 * 7.5 = 0.000007398 W</code></li>
-		<li>Total: <code>0.000001523 + 0.000007398 = 0.000008921 W</code></li>
+		<li>Read: <code>${AVG[Read from disk]} / 1024 / 529 * 1.65 = $read_from_disk_w W</code></li>
+		<li>Write: <code>${AVG[Written to disk]} / 1024 / 495 * 7.5 = $written_to_disk_w W</code></li>
+		<li>Total: <code>$read_from_disk_w + $written_to_disk_w = $disk_w W</code></li>
 	</ul>
 	
 	<h4>Network card power consumption</h4>
 	
-	<p>As an example, the <a href="https://www.fs.com/products/75603.html">Intel 25 Gigabit SFP28 network interface card</a> has a speed of 3125&nbsp;MiB/s (25&nbsp;Gb/s) for a max power consumption of 14.1&nbsp;W. The CARI daemon receives about 2&nbsp;KiB of data per second and sends also about 2&nbsp;KiB of data per second. Proportionally, the calculated power consumption is negligible (about 0.01% of the CPU consumption):</p>
+	<p>As an example, the <a href="https://www.fs.com/products/75603.html">Intel 25 Gigabit SFP28 network interface card</a> has a speed of 3125&nbsp;MiB/s (25&nbsp;Gb/s) for a max power consumption of 14.1&nbsp;W. The CARI daemon received ${AVG[Network traffic received]}&nbsp;KiB of data per second and sent ${AVG[Network traffic sent]}&nbsp;KiB of data per second. Proportionally, the calculated power consumption is negligible (about $network_part_cpu% of the CPU consumption):</p>
 	
-	<p><code>(2 + 2) / 1024 / 3125 * 14.1 = 0.000017625 W</code></p>
+	<p><code>(${AVG[Network traffic received]} + ${AVG[Network traffic sent]}) / 1024 / 3125 * 14.1 = $network_w W</code></p>
 	
 	<h4>DRAM power consumption</h4>
 	
 	<p>DRAM (Dynamic Random Access Memory) is a volatile memory that needs to be refreshed periodically. It means that DRAM modules consume energy independently of the activity of the processes. Although the DRAM power consumption is higher than that of the disk and the network card, it's still much smaller than that of the CPU.</p>
 	
-	<p>The power consumption of DRAM modules depend on their underlying technology. The Samsung high-density <a href="https://samsungatfirst.com/256gb-ddr4-rdimm/">256 GiB DDR4 RDIMM</a> for data centers, first announced in 2018, has a max power consumption of 15&nbsp;W. RAM usage for the CARI daemon is about 125&nbsp;MiB. Proportionally, the calculated power consumption is negligible (about 4.3% of the CPU consumption):</p>
+	<p>The power consumption of DRAM modules depend on their underlying technology. The Samsung high-density <a href="https://samsungatfirst.com/256gb-ddr4-rdimm/">256 GiB DDR4 RDIMM</a> for data centers, first announced in 2018, has a max power consumption of 15&nbsp;W. RAM usage for the CARI daemon was ${AVG[RAM usage]}&nbsp;MiB. Proportionally, the calculated power consumption is only $ram_samsung_part_cpu% of the CPU consumption:</p>
 	
-	<p><code>125 / 1024 / 256 * 15 = 0.007152557 W</code></p>
+	<p><code>${AVG[RAM usage]} / 1024 / 256 * 15 = $ram_samsung_w W</code></p>
 	
-	<p>Even without this specialized and next-generation memory module for data centers, the DRAM power consumption for the CARI daemon is still low when calculated for the older DDR3 generation. According to <a href="https://www.eurecom.fr/~appuswam/files/damon15-memory.pdf">Appuswamy et al, 2015</a>, DDR3 RDIMM modules have a loaded consumption of 0.2&nbsp;W/GiB and idle consumption of 0.04&nbsp;W/GiB. Calculating the CARI daemon consumption using a mix of these two values gives only 8.8% of the CPU consumption:</p>
+	<p>Even without this specialized and next-generation memory module for data centers, the DRAM power consumption for the CARI daemon is still low when calculated for the older DDR3 generation. According to <a href="https://www.eurecom.fr/~appuswam/files/damon15-memory.pdf">Appuswamy et al, 2015</a>, DDR3 RDIMM modules have a loaded consumption of 0.2&nbsp;W/GiB and idle consumption of 0.04&nbsp;W/GiB. Calculating the CARI daemon consumption using a mix of these two values gives $ram_ddr3_part_cpu% of the CPU consumption:</p>
 	
-	<p><code>125 / 1024 * (0.04 + 0.2) / 2 = 0.014648438 W</code></p>
+	<p><code>${AVG[RAM usage]} / 1024 * (0.04 + 0.2) / 2 = $ram_ddr3_w W</code></p>
 	
 	<p>It's worth noting that DDR3 modules are more energy consuming than DDR4 modules because they operate at a voltage of 1.5&nbsp;V instead of 1.2&nbsp;V for DDR4, and they're near phased out, representing only <a href="https://www.statista.com/statistics/553383/worldwide-dram-market-share-by-architecture/">8% of the market share</a> in 2021, compared to 90% for DDR4.
 	
@@ -1762,7 +1778,7 @@ get_report_template() {
 	
 	<p>Here are the calculated averages from the raw data:</p>
 	
-	$(cat "${LOC[tmp]}/report-averages.html")
+	$(cat "${LOC[tmp]}/html:averages.html")
 	
 	<h3>Raw data</h3>
 	
@@ -1772,23 +1788,23 @@ get_report_template() {
 	
 	<p>Below are the graphs generated from the raw data. They are displayed horizontally, then vertically.</p>
 	
-	<img class="report first" src="${LOC[report]}/img/gnuplot:cpu.png" alt="" />
+	<img class="report first" src="${LOC[tmp]}/gnuplot:png:cpu.png" alt="" />
 	
-	<img class="report" src="${LOC[report]}/img/gnuplot:disk.png" alt="" />
+	<img class="report" src="${LOC[tmp]}/gnuplot:png:disk.png" alt="" />
 	
-	<img class="report" src="${LOC[report]}/img/gnuplot:memory.png" alt="" />
+	<img class="report" src="${LOC[tmp]}/gnuplot:png:memory.png" alt="" />
 	
-	<img class="report last" src="${LOC[report]}/img/gnuplot:traffic.png" alt="" />
+	<img class="report last" src="${LOC[tmp]}/gnuplot:png:traffic.png" alt="" />
 	
 	<p>The same four graphs are displayed vertically below:</p>
 	
-	<img class="report vertical" src="${LOC[report]}/img/gnuplot:cpu-v.png" alt="" />
+	<img class="report vertical" src="${LOC[tmp]}/gnuplot:png:cpu-v.png" alt="" />
 	
-	<img class="report vertical" src="${LOC[report]}/img/gnuplot:disk-v.png" alt="" />
+	<img class="report vertical" src="${LOC[tmp]}/gnuplot:png:disk-v.png" alt="" />
 	
-	<img class="report vertical" src="${LOC[report]}/img/gnuplot:memory-v.png" alt="" />
+	<img class="report vertical" src="${LOC[tmp]}/gnuplot:png:memory-v.png" alt="" />
 	
-	<img class="report vertical" src="${LOC[report]}/img/gnuplot:traffic-v.png" alt="" />
+	<img class="report vertical" src="${LOC[tmp]}/gnuplot:png:traffic-v.png" alt="" />
 	
 	</body>
 	</html>
@@ -1841,7 +1857,7 @@ install_packages() {
 
 # Install the CARI wallet.
 install_wallet() {
-	local filename msg_err tar_exit_status v wallet_url working_folder
+	local filename msg_err exit_status working_folder
 	
 	# ------------------
 	
@@ -1850,33 +1866,26 @@ install_wallet() {
 		working_folder=$(pwd)
 		cd -- "${LOC[tmp]}" || exit_script 1 "Can't enter \"${LOC[tmp]}\"."
 		
-		v=${HOST_INFO[main_os_version]}
+		filename=${LOC[wallet_url]##*/}
+		wget -q -O "${LOC[tmp]}/$filename" "${LOC[wallet_url]}"
 		
-		if [[ -n ${LOC[wallet_${v}_url]} ]]; then
-			wallet_url=${LOC[wallet_${v}_url]}
-			filename=${wallet_url##*/}
-			wget -q -O "${LOC[tmp]}/$filename" "$wallet_url"
+		if [[ -f "${LOC[tmp]}/$filename" ]]; then
+			mkdir -p "${LOC[wallet]}"
+			unzip -j -q "$filename" -d "${LOC[wallet]}" 2> /dev/null
+			exit_status=$?
+			cd -- "$working_folder" || exit_script 1 "Can't enter \"$working_folder\"."
 			
-			if [[ -f "${LOC[tmp]}/$filename" ]]; then
-				mkdir -p "${LOC[wallet]}"
-				tar xzf "$filename" -C "${LOC[wallet]}/" 2> /dev/null
-				tar_exit_status=$?
-				cd -- "$working_folder" || exit_script 1 "Can't enter \"$working_folder\"."
+			if [[ $exit_status != 0 ]] || ! is exec "${LOC[cli_file]}" || ! is exec "${LOC[daemon_file]}"; then
+				msg_err="Error while installing the CARI wallet."
 				
-				if [[ $tar_exit_status != 0 ]] || ! is exec "${LOC[cli_file]}" || ! is exec "${LOC[daemon_file]}"; then
-					msg_err="Error while installing the ${CRYPTO[name]} wallet."
-					
-					if [[ $tar_exit_status != 0 ]]; then
-						msg_err+=" tar exit status is $tar_exit_status."
-					fi
+				if [[ $exit_status != 0 ]]; then
+					msg_err+=" unzip exit status is $exit_status."
 				fi
-				
-				rm "${LOC[tmp]}/$filename"
-			else
-				msg_err="Can't download \"$wallet_url\"."
 			fi
+			
+			rm "${LOC[tmp]}/$filename"
 		else
-			msg_err="Can't find the wallet URL for ${HOST_INFO[os]} ${HOST_INFO[os_version]}."
+			msg_err="Can't download \"${LOC[wallet_url]}\"."
 		fi
 		
 		if [[ -n $msg_err ]]; then
@@ -2245,6 +2254,9 @@ fi
 # CONSTANTS, 2 of 2
 ################################################################################
 
+REPORT_DATE=$(date +"%Y-%m-%d_%H-%M-%S")
+declare -r REPORT_DATE
+
 # LOCATIONS
 ###########
 
@@ -2269,8 +2281,9 @@ fi
 
 LOC[installed_packages_file]="${LOC[apps]}/installed-packages.txt"
 
-LOC[report]="${LOC[reports]}/$(date +"%Y-%m-%d_%H:%M:%S")"
-LOC[report_img]="${LOC[report]}/img"
+LOC[report]="${LOC[reports]}/$REPORT_DATE"
+LOC[report_pdf_file]="${LOC[report]}/report-$REPORT_DATE.pdf"
+LOC[report_txt_file]="${LOC[report]}/report-$REPORT_DATE.txt"
 
 LOC[wallet]="${LOC[apps]}/cari-wallet"
 LOC[wallet_data]="${LOC[wallet]}/datadir"
@@ -2295,10 +2308,7 @@ LOC[weasyprint_file]="${LOC[weasyprint]}/bin/weasyprint"
 LOC[bc1_url]="https://cari-explorer.projectmerge.org/api/getblockcount"
 LOC[bc2_url]="https://explorer.cri.eco/api/getblockcount"
 
-LOC[wallet_16_url]="https://github.com/Carbon-Reduction-Initiative/CARI/releases/download/CARIv1.1.0/CARI-v1.1.0-linux-ubuntu16.tar.gz"
-LOC[wallet_18_url]="https://github.com/Carbon-Reduction-Initiative/CARI/releases/download/CARIv1.1.0/CARI-v1.1.0-linux-ubuntu18.tar.gz"
-LOC[wallet_20_url]="https://notifs.cri.eco/download/CARI-v1.0.2-linux-ubuntu20.tar.gz"
-LOC[wallet_21_url]=${LOC[wallet_20_url]}
+LOC[wallet_url]="https://github.com/Carbon-Reduction-Initiative/CARI/releases/download/CARIv1.2.3/cari-1.2.3-linux-x86-64.zip"
 
 declare -r LOC
 
@@ -2694,41 +2704,32 @@ if [[ -z ${SETTINGS[generate_report]} ]]; then
 	
 	header_content+=${FORMAT[sep1]}$N
 	
-	echo -n "$header_content" > "${LOC[tmp]}/report-header.txt"
+	echo -n "$header_content" > "${LOC[tmp]}/txt:header.txt"
 	
 	report_results=$(cat "${LOC[tmp]}/report:"*.txt | grep -v "^stop$")
 	report_results=$(echo -n "$report_results" | sort)$N
 	report_results=$(sed -E "s/^([0-9_:.-]+: block )/${FORMAT[sep2]}\n\1/" <<< "$report_results")
 	
-	echo -n "$report_results" > "${LOC[tmp]}/report-results.txt"
+	echo -n "$report_results" > "${LOC[tmp]}/txt:results.txt"
 fi
 
-cat "${LOC[tmp]}/report-header.txt" "${LOC[tmp]}/report-results.txt" > "${LOC[report]}/report.txt"
-
-# Copy secondary reports
-########################
-
-if [[ ${SETTINGS[enable_psr]} == true ]]; then
-	if [[ -f "${LOC[tmp]}/psrecord.png" ]]; then
-		cp "${LOC[tmp]}/psrecord.png" "${LOC[report]}/img/"
-	fi
-	
-	if [[ -f "${LOC[tmp]}/psrecord.txt" ]]; then
-		cp "${LOC[tmp]}/psrecord.txt" "${LOC[report]}"
-	fi
-fi
+cat "${LOC[tmp]}/txt:header.txt" "${LOC[tmp]}/txt:results.txt" > "${LOC[report_txt_file]}"
 
 # Generate plots
 ################
 
-generate_plots
-
-for graph in "${LOC[report]}/img/gnuplot:"*.png; do
-	convert "$graph" -rotate 270 "${graph%.*}-v.png"
-done
-
-format_png "${LOC[report]}/img/"*.png
-optimize_png "${LOC[report]}/img/"*.png
+if [[ -z ${SETTINGS[generate_report]} ]]; then
+	generate_plots
+	
+	for graph in "${LOC[tmp]}/gnuplot:png:"*.png; do
+		convert "$graph" -rotate 270 "${graph%.*}-v.png"
+	done
+	
+	format_png "${LOC[tmp]}/"*.png
+	optimize_png "${LOC[tmp]}/"*.png
+else
+	calc_avg_from_raw_data
+fi
 
 # Generate the report in PDF format
 ###################################
@@ -2750,8 +2751,8 @@ if [[ -z ${SETTINGS[generate_report]} ]]; then
 	avg_raw_data="$N${FORMAT[sep1]}${N}+ Averages calculated from the raw data:$N"
 	avg_raw_data_html="<ul>$N"
 	
-	avg_raw_data+=$(sed "s/^/  - /" <<< "$avg_content")
-	avg_raw_data_html+=$(sed -E "s~^(.+)$~<li>\1</li>~" <<< "$avg_content")
+	avg_raw_data+=$(echo -n "$avg_content" | sed "s/^/  - /")$N
+	avg_raw_data_html+=$(echo -n "$avg_content" | sed -E "s~^(.+)$~<li>\1</li>~")$N
 	
 	avg_raw_data+="${FORMAT[sep2]}$N+ Here's for the energy consumption:$N"
 	avg_raw_data_html+="</ul>$N<p>Here's for the energy consumption:</p>$N<ul>$N"
@@ -2765,31 +2766,44 @@ if [[ -z ${SETTINGS[generate_report]} ]]; then
 	avg_raw_data+=${FORMAT[sep1]}$N
 	avg_raw_data_html+="</ul>$N"
 	
-	echo -n "$avg_raw_data" > "${LOC[tmp]}/report-averages.txt"
-	echo -n "$avg_raw_data_html" > "${LOC[tmp]}/report-averages.html"
+	echo -n "$avg_raw_data" > "${LOC[tmp]}/txt:averages.txt"
+	echo -n "$avg_raw_data_html" > "${LOC[tmp]}/html:averages.html"
 fi
 
-cat "${LOC[tmp]}/report-averages.txt" >> "${LOC[report]}/report.txt"
+cat "${LOC[tmp]}/txt:averages.txt" >> "${LOC[report_txt_file]}"
 
 generate_report_pdf
+
+# Copy secondary reports
+########################
+
+if [[ ${SETTINGS[enable_psr]} == true ]]; then
+	if [[ -f "${LOC[tmp]}/psrecord.png" ]]; then
+		cp "${LOC[tmp]}/psrecord.png" "${LOC[report]}/"
+	fi
+	
+	if [[ -f "${LOC[tmp]}/psrecord.txt" ]]; then
+		cp "${LOC[tmp]}/psrecord.txt" "${LOC[report]}"
+	fi
+fi
 
 # File permissions
 ##################
 
 adjust_file_permissions
 
-# Backup the raw data
-#####################
+# Backup data
+#############
 
-cd -- "${LOC[script]}" || exit_script 1 "Can't enter \"${LOC[script]}\"."
-zip -q -r "${LOC[report]}/raw-data.zip" "tmp"
+cd -- "${LOC[tmp]%/*}" || exit_script 1 "Can't enter \"${LOC[tmp]%/*}\"."
+zip -q -r "${LOC[report]}/raw-data.zip" "${LOC[tmp]##*/}"
 chmod u=rwX,go=rwX "${LOC[report]}/raw-data.zip"
 
 # Upload the report
 ###################
 
 if [[ ${SETTINGS[upload_report]} == true ]]; then
-	curl -H "Max-Downloads: 1" -H "Max-Days: 1" --upload-file "${LOC[report]}/report.pdf" "https://transfer.sh/report-${LOC[report]##*/}.pdf"
+	curl -H "Max-Downloads: 1" -H "Max-Days: 1" --upload-file "${LOC[report_pdf_file]}" "https://transfer.sh/${LOC[report_pdf_file]##*/}"
 fi
 
 # Clean up the temporary directory (if applicable)
@@ -2803,4 +2817,4 @@ fi
 # Display the report
 ####################
 
-cat "${LOC[report]}/report.txt"
+cat "${LOC[report_txt_file]}"
